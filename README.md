@@ -1,8 +1,8 @@
 # thumbs
 
-A toolkit for building YouTube thumbnails in the michaelgreenly.dev visual
-system: subject on one side of the frame, headline on the other, a full-width
-bar along the bottom, exactly one accent per image.
+A toolkit for building YouTube thumbnails to one fixed layout: subject on one
+side of the frame, headline on the other, a full-width bar along the bottom,
+exactly one accent per image.
 
 One command builds a whole thumbnail:
 
