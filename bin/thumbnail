@@ -50,7 +50,8 @@ import subprocess
 import sys
 
 BIN = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, BIN)
+LIB = os.path.join(os.path.dirname(BIN), "lib")
+sys.path.insert(0, LIB)
 
 import thumblayout
 

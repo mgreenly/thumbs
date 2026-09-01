@@ -6,8 +6,8 @@
 
 Every other tool in the pipeline takes its sizes from here. `headline` and
 `banner` are handed the boxes this prints; `compose` places their output at the
-offsets this prints. The numbers themselves live in `thumblayout.py`, so tuning
-the composition is an edit to that one file.
+offsets this prints. The numbers themselves live in `lib/thumblayout.py`, so
+tuning the composition is an edit to that one file.
 
 `--side` names the side the *subject* stands on. The type column takes the
 other side and the backdrop hotspot follows the type.
@@ -23,7 +23,8 @@ import os
 import re
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 
 import thumblayout
 

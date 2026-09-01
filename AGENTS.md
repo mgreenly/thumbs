@@ -207,7 +207,7 @@ not an open one. The defaults are:
 
 - `bin/thumbnail` — the whole pipeline in one command. This is what a session
   runs.
-- `bin/thumblayout.py` — every fixed coordinate in the system, as fractions of
+- `lib/thumblayout.py` — every fixed coordinate in the system, as fractions of
   the canvas. **No other file may know a geometry number.**
 - `bin/layout` — prints those boxes as `json`, `sh`, or `table`.
 - `bin/freebox` — per-frame geometry measured from the placed subject's
@@ -268,7 +268,7 @@ Two constants in `freebox` are the composition, and are settled:
   rather than penalized; a preference would let a big enough strip win anyway,
   which is the failure the band exists to prevent.
 
-Treat both as locked, the same as the proportions in `thumblayout.py`. The
+Treat both as locked, the same as the proportions in `lib/thumblayout.py`. The
 `tall` band in particular has been through one composite, not the dozen the
 `wide` one has, so it is the first number to revisit if a list lands badly.
 
@@ -345,7 +345,7 @@ few percent of edge noise and no positional drift.
 
 ## Standing rules
 
-**The composition is locked.** The proportions in `thumblayout.py` and the
+**The composition is locked.** The proportions in `lib/thumblayout.py` and the
 constants in `freebox` were settled by eye against rendered composites and
 approved. Change one only when the operator asks for that change. Tuning them
 to make a particular headline fit is wrong; change the line count or the copy
@@ -377,8 +377,13 @@ final size.
 
 ## The tree stays minimal
 
-This file and `bin/` are the whole project. There is no README, no notes file,
-and no scratch work here. Earlier ones were deleted because they documented a
-pipeline that no longer exists, and a stale document is worse than none. If
-something needs saying, it is said here. Session work lives in the dated
-Dropbox folder, never in this tree.
+This file, `bin/` and `lib/` are the whole project. `bin/` holds the commands,
+every one of them executable and without a suffix; `lib/` holds the importable
+code, which is `thumblayout.py` and nothing else. A file that is only ever
+imported does not belong in `bin/`.
+
+The README is a few lines pointing here and is the one exception. There is no
+notes file and no scratch work. Earlier ones were deleted because they
+documented a pipeline that no longer exists, and a stale document is worse than
+none. If something needs saying, it is said here. Session work lives in the
+dated Dropbox folder, never in this tree.
