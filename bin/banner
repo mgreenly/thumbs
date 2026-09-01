@@ -8,8 +8,8 @@ The output is a PNG exactly the size of the box, transparent except for the bar
 itself. Where it sits in the frame is `compose`'s problem, and the box comes
 from `layout`.
 
-This is the michaelgreenly.dev answer to the yellow bar on the Matt Maher
-thumbnails. That bar is doing two jobs, carrying a color signal and anchoring
+This is the house answer to the bright yellow bar this layout is descended
+from. That bar is doing two jobs, carrying a color signal and anchoring
 the composition with a band of visual weight. Against a pale tinted plate the
 weight matters more, and the site palette has no yellow, so the bar is
 #18181B, the site's text color. Keeping it dark rather than blue also keeps
@@ -19,7 +19,7 @@ stop being a signal.
 
 The copy is set in IBM Plex Mono, the site's third face and otherwise unused
 here. It supplies the texture contrast against the IBM Plex Sans headline that
-Maher gets from setting his bar in an italic serif, and mono reads as
+the original gets from setting its bar in an italic serif, and mono reads as
 developer, which is the channel.
 
 No type is set here. A word wrapped in asterisks is an accent exactly as it is

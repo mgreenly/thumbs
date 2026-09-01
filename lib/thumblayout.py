@@ -23,8 +23,8 @@ EXPORT = (1280, 720)
 
 # --- bottom bar -------------------------------------------------------------
 
-# Maher's yellow bar runs about 15% of frame height. 14% carries the same
-# weight without eating into the headline's descenders.
+# The bar this layout is descended from runs about 15% of frame height. 14%
+# carries the same weight without eating into the headline's descenders.
 BANNER_HEIGHT = 0.14
 
 # --- headline ---------------------------------------------------------------
@@ -59,7 +59,7 @@ SUBJECT_CENTER_INSET = 0.26
 
 # The framings, named for the share of the frame the portrait takes: the
 # operator says "portrait 1/3 left" or "portrait 3/5 left", and `full` is the
-# Maher half-frame those are alternatives to. Each names a subject height as a
+# house half-frame those are alternatives to. Each names a subject height as a
 # fraction of canvas height and a center inset as a fraction of canvas width
 # from the subject's own side, so the whole of a framing is where the person is
 # and how big.
@@ -112,7 +112,7 @@ def compute(canvas=CANVAS, side="right", subject_inset=None, framing="full"):
     pushes the subject further into its corner. `None` uses the default.
 
     `framing` is how big the subject is and where it sits, named for the share
-    of the frame the portrait takes: `full` is the Maher half-frame, `1/3` and
+    of the frame the portrait takes: `full` is the house half-frame, `1/3` and
     `3/5` are the smaller ones. It says nothing about the stage. It is not a
     cosmetic flag either: every tool that places the subject has to pass the
     same value or they will disagree about where the person is.

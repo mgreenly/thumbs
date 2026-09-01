@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Set a headline into a box on a transparent canvas, in the michaelgreenly.dev
-display style.
+"""Set a headline into a box on a transparent canvas, in the house display
+style.
 
 The output is a PNG the size of the box, with nothing in it but the type. There
 is no underlying image: compositing the result onto a plate is somebody else's
@@ -746,7 +746,7 @@ def build_parser():
         prog="headline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Set a headline into a box on a transparent canvas, in the "
-        "michaelgreenly.dev display style.",
+        "house display style.",
         epilog=(
             "accent:\n"
             "  Wrap a word or phrase in asterisks to set it in the accent face and\n"

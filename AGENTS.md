@@ -1,9 +1,8 @@
 # thumbs
 
 A toolkit and a conversation protocol for building YouTube thumbnails in the
-michaelgreenly.dev visual system. The layout is modeled on the Matt Maher
-(`@MetalSole`) thumbnails: subject on one side of the frame, headline on the
-other, a full-width bar along the bottom, exactly one accent per image.
+house visual system: subject on one side of the frame, headline on the other,
+a full-width bar along the bottom, exactly one accent per image.
 
 This tree is *only* that. Nothing else belongs here. A session is a
 conversation with the operator that ends in a rendered thumbnail.
@@ -237,7 +236,7 @@ than restating it here.
 ## Where the headline goes
 
 `thumblayout` gives the headline a fixed column on the side opposite the
-subject. That is the Maher grid and it is right when the subject is a clean
+subject. That is the house grid and it is right when the subject is a clean
 half-frame silhouette. It wastes space the moment the subject is small, off in
 a corner, or reaching a hand into what would otherwise be the type column: the
 column cannot move, so the type shrinks to dodge the hand instead of sitting
@@ -352,9 +351,10 @@ to make a particular headline fit is wrong; change the line count or the copy
 instead.
 
 **The palette is the site's, and it has no yellow and no red.** `#2563EB`
-accent, `#18181B` text and bar, `#FFFFFF` bar copy. Maher's yellow bar becomes
-a dark bar, and his rotated red badge is deliberately not implemented. Blue
-means exactly one thing everywhere: the accent.
+accent, `#18181B` text and bar, `#FFFFFF` bar copy. The bright yellow bar this
+layout is descended from becomes a dark bar, and the rotated red badge that
+went with it is deliberately not implemented. Blue means exactly one thing
+everywhere: the accent.
 
 **Faces.** IBM Plex Sans SemiBold sets the headline, Space Grotesk Bold its
 accents, IBM Plex Mono the banner. All three are installed in
