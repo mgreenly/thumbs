@@ -1,0 +1,1033 @@
+#!/usr/bin/env python3
+"""Set a headline into a box on a transparent canvas, in the michaelgreenly.dev
+display style.
+
+The output is a PNG the size of the box, with nothing in it but the type. There
+is no underlying image: compositing the result onto a plate is somebody else's
+job.
+
+Body copy is IBM Plex Sans SemiBold in black. A word or phrase wrapped in
+asterisks is set in Space Grotesk Bold in the site's accent blue, the same blue
+the word "technology" uses in the site headline:
+
+    headline out.png --box 2220x1050 \\
+      -t '*ai* has changed' -t 'the math' -t 'of custom software'
+
+By default the pointsize is solved, not supplied: the script binary-searches the
+largest size at which the widest line fits the box width and the stacked block
+fits the box height. Both are measured from the faces' own ascent and descent
+rather than from the ink of the particular letters typed, so two thumbnails
+built with the same box and the same size have their baselines in exactly the
+same place regardless of what the copy says.
+
+All measurement goes through the same ImageMagick annotate engine that does the
+rendering, so what is measured is what is drawn.
+"""
+
+import argparse
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+FONT = "IBM-Plex-Sans-SemiBold"  # --font-body at weight 600
+COLOR = "#000000"
+ACCENT_FONT = "Space-Grotesk-Bold"  # --font-display at weight 700
+ACCENT_COLOR = "#2563EB"  # --color-accent, the blue on "technology"
+LINE_HEIGHT = 1.05  # .display line-height
+TRACKING = -0.02  # .display letter-spacing, in em
+
+METRICS_RE = re.compile(r"width:\s*(-?\d+).*?ascent:\s*(-?\d+).*?descent:\s*(-?\d+)")
+BOX_RE = re.compile(r"^(\d+)x(\d+)$")
+# A '%' that ImageMagick's annotate would read as a property escape rather than
+# as a literal percent sign.
+ESCAPE_RE = re.compile(r"%[A-Za-z\[]")
+# Formats with no alpha channel would flatten the transparent canvas to a solid
+# color, which is the one thing this script exists not to do.
+OPAQUE_SUFFIXES = (".jpg", ".jpeg", ".jpe", ".bmp", ".pbm", ".pgm", ".ppm")
+
+ACCENT_MARK = "*"
+
+
+def die(msg):
+    print(f"headline: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def run(cmd):
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        sys.exit(result.returncode)
+
+
+def capture(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def image_size(path):
+    out = capture(["magick", "identify", "-format", "%w %h", path])
+    if out.returncode != 0:
+        die(f"could not read image {path!r}: {out.stderr.strip()}")
+    try:
+        w, h = (int(n) for n in out.stdout.split()[:2])
+    except ValueError:
+        die(f"unexpected identify output for {path!r}: {out.stdout!r}")
+    return w, h
+
+
+# ---------------------------------------------------------------- text parsing
+
+
+def parse_line(raw):
+    """Split a line into [(text, is_accent), ...] on *...* spans.
+
+    A backslash escapes a literal asterisk. An unclosed span is an error rather
+    than a guess, because guessing would silently mis-set a word in the wrong
+    face and color.
+    """
+    segments = []
+    buf = []
+    accent = False
+    i = 0
+    while i < len(raw):
+        c = raw[i]
+        if c == "\\" and i + 1 < len(raw) and raw[i + 1] in (ACCENT_MARK, "\\"):
+            buf.append(raw[i + 1])
+            i += 2
+            continue
+        if c == ACCENT_MARK:
+            segments.append(("".join(buf), accent))
+            buf = []
+            accent = not accent
+        else:
+            buf.append(c)
+        i += 1
+    if accent:
+        die(
+            f"unclosed '{ACCENT_MARK}' in line {raw!r} "
+            f"(use \\{ACCENT_MARK} for a literal)"
+        )
+    segments.append(("".join(buf), False))
+    return [s for s in segments if s[0]]
+
+
+def apply_case(segments, case):
+    if case == "upper":
+        return [(t.upper(), a) for t, a in segments]
+    return segments
+
+
+# ------------------------------------------------------------------- measuring
+
+
+class Measurer:
+    """Type metrics from ImageMagick, memoized per font. Kerning tracks the
+    pointsize, so -0.02em stays -0.02em at every size the search tries.
+
+    The two faces are measured separately and their metrics combined, because
+    a line mixes them: the body font sets most of the words and the accent font
+    sets the ones in asterisks.
+    """
+
+    def __init__(self, font, accent_font, tracking):
+        self.fonts = (font, accent_font)
+        self.tracking = tracking
+        self.cache = {}
+
+    def font_for(self, is_accent):
+        return self.fonts[1] if is_accent else self.fonts[0]
+
+    def kerning(self, pointsize):
+        return self.tracking * pointsize
+
+    def metrics(self, font, text, pointsize):
+        """Return (advance_width, ascent, descent) in pixels; descent is positive."""
+        if not text:
+            _, asc, desc = self.metrics(font, "X", pointsize)
+            return 0.0, asc, desc
+        if text.startswith(" "):
+            # ImageMagick throws leading spaces away before it measures, and
+            # refuses outright to measure a string that is nothing but spaces.
+            # Measuring behind a sentinel glyph makes the spaces interior, so
+            # they count; subtracting the glyph and the kerning step it adds
+            # leaves the advance every other string reports.
+            anchor, asc, desc = self.metrics(font, "X", pointsize)
+            width = self.metrics(font, "X" + text, pointsize)[0]
+            return width - anchor - self.kerning(pointsize), asc, desc
+        key = (font, text, pointsize)
+        if key in self.cache:
+            return self.cache[key]
+        out = capture(
+            [
+                "magick",
+                "-font",
+                font,
+                "-pointsize",
+                f"{pointsize:g}",
+                "-kerning",
+                f"{self.kerning(pointsize):g}",
+                "-debug",
+                "annotate",
+                "xc:",
+                "-annotate",
+                "0",
+                text,
+                "null:",
+            ]
+        )
+        match = METRICS_RE.search(out.stdout + out.stderr)
+        if not match:
+            die(
+                f"could not measure text with font {font!r}; "
+                f"ImageMagick said: {(out.stderr or out.stdout).strip()[:200]}"
+            )
+        width, ascent, descent = (int(n) for n in match.groups())
+        value = (float(width), float(ascent), abs(float(descent)))
+        self.cache[key] = value
+        return value
+
+    def segment_width(self, text, is_accent, pointsize):
+        return self.metrics(self.font_for(is_accent), text, pointsize)[0]
+
+    def drawable(self, text, is_accent, pointsize):
+        """(text to draw, x shift) for a segment.
+
+        ImageMagick's -annotate counts leading spaces when it measures a string
+        and then throws them away when it draws it, so a segment that starts
+        after an accent word would land hard against it. Drop the spaces from
+        the draw and add their advance to the x instead. The extra kerning step
+        is the one between the last space and the first glyph, which measuring
+        the spaces on their own does not include.
+        """
+        rest = text.lstrip(" ")
+        if rest == text:
+            return text, 0.0
+        lead = text[: len(text) - len(rest)]
+        font = self.font_for(is_accent)
+        shift = self.metrics(font, lead, pointsize)[0]
+        if rest:
+            shift += self.kerning(pointsize)
+        return rest, shift
+
+    def offsets(self, segments, pointsize):
+        """(x offset, advance width) for each segment, relative to the line's
+        left edge.
+
+        ImageMagick puts the kerning between glyphs and not after the last one,
+        so a segment boundary costs one kerning step that measuring the segments
+        separately would otherwise drop. Adding it back makes the sum identical
+        to what a single-font draw of the whole line would advance.
+        """
+        kerning = self.kerning(pointsize)
+        out = []
+        x = 0.0
+        for i, (text, is_accent) in enumerate(segments):
+            width = self.segment_width(text, is_accent, pointsize)
+            out.append((x, width))
+            x += width + kerning
+        return out
+
+    def line_width(self, segments, pointsize):
+        if not segments:
+            return 0.0
+        x, width = self.offsets(segments, pointsize)[-1]
+        return x + width
+
+    def face(self, pointsize):
+        """(ascent, descent) of the faces themselves, independent of the copy.
+
+        The tallest ascent and deepest descent of the two faces win, so the line
+        advance and the block height do not change when a line happens to have
+        an accent word in it.
+        """
+        pairs = [self.metrics(f, "X", pointsize)[1:] for f in self.fonts]
+        return max(a for a, _ in pairs), max(d for _, d in pairs)
+
+
+# ------------------------------------------------------------------- balancing
+
+# Widths scale linearly with pointsize, so any reference size ranks candidate
+# breaks identically. This one is only large enough that integer rounding in the
+# metrics does not swamp the comparison between two near-equal candidates.
+BALANCE_POINTSIZE = 200
+
+
+def words_from(lines):
+    """Flatten parsed lines into accent-tagged words.
+
+    Whatever line structure the caller typed is discarded: --lines means the
+    breaks are ours to choose. The accent flag rides along on each word, so a
+    span that covers several words stays accented no matter where it is broken.
+    """
+    return [
+        (word, accent)
+        for segments in lines
+        for text, accent in segments
+        for word in text.split()
+    ]
+
+
+def segments_from_words(words):
+    """Rebuild a line's segments from accent-tagged words.
+
+    When the accent changes mid-line the separating space goes on the *following*
+    segment, never trailing on the previous one. That is not arbitrary: -annotate
+    strips leading spaces and Measurer.drawable already compensates for exactly
+    that case, while a trailing space is measured and drawn inconsistently.
+    """
+    segments = []
+    for word, accent in words:
+        if segments and segments[-1][1] == accent:
+            segments[-1] = (segments[-1][0] + " " + word, accent)
+        elif segments:
+            segments.append((" " + word, accent))
+        else:
+            segments.append((word, accent))
+    return segments
+
+
+def balance_lines(words, count, measurer):
+    """Break words into exactly `count` lines, minimising the widest line.
+
+    Uniform fit solves the largest pointsize at which the widest line still fits
+    the box, so the narrowest achievable maximum line is also the largest
+    achievable type. Minimising the maximum is therefore not just a tidier
+    ragged edge, it is bigger type for the same copy.
+
+    Ties are broken on the sum of squared line widths, which evens out the rest
+    of the stack once the widest line is settled. Without the tiebreak, the
+    words left over after the widest line is fixed can pile up anywhere.
+
+    Widths come from the same measurer that sets the type, so an accent word is
+    costed in the accent face. Character counts would misjudge every line that
+    has one, because the two faces have different advance widths.
+    """
+    n = len(words)
+    if count > n:
+        die(f"--lines {count} needs at least {count} words, got {n}")
+
+    # width[i][j] is the rendered width of words[i:j] as a single line.
+    width = [[0.0] * (n + 1) for _ in range(n + 1)]
+    for i in range(n):
+        for j in range(i + 1, n + 1):
+            width[i][j] = measurer.line_width(
+                segments_from_words(words[i:j]), BALANCE_POINTSIZE
+            )
+
+    inf = float("inf")
+    # best[k][i] is (widest line, sum of squares) for k lines covering words[i:].
+    best = [[(inf, inf)] * (n + 1) for _ in range(count + 1)]
+    split = [[None] * (n + 1) for _ in range(count + 1)]
+    best[0][n] = (0.0, 0.0)
+    for k in range(1, count + 1):
+        for i in range(n):
+            for j in range(i + 1, n + 1):
+                widest_tail, squares_tail = best[k - 1][j]
+                if widest_tail == inf:
+                    continue
+                w = width[i][j]
+                candidate = (max(w, widest_tail), w * w + squares_tail)
+                if candidate < best[k][i]:
+                    best[k][i] = candidate
+                    split[k][i] = j
+
+    if best[count][0][0] == inf:
+        die(f"could not break {n} words into {count} lines")
+
+    out = []
+    i = 0
+    for k in range(count, 0, -1):
+        j = split[k][i]
+        out.append(segments_from_words(words[i:j]))
+        i = j
+    return out
+
+
+def block_height(lines, pointsize, line_height, measurer):
+    ascent, descent = measurer.face(pointsize)
+    advance = round(line_height * pointsize)
+    return int(round(advance * (len(lines) - 1) + ascent + descent))
+
+
+def solve_pointsize(lines, box_w, box_h, line_height, measurer):
+    """Largest integer pointsize fitting the box in both axes."""
+
+    def fits(p):
+        if max(measurer.line_width(s, p) for s in lines) > box_w:
+            return False
+        return block_height(lines, p, line_height, measurer) <= box_h
+
+    if not fits(1):
+        die(f"box {box_w}x{box_h} is too small for this headline at any size")
+    lo, hi = 1, int(box_h) + 1
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if fits(mid):
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
+# ------------------------------------------------------------------- rendering
+
+
+def align_offset(size, extent, where):
+    if where in ("center", "middle"):
+        return (extent - size) / 2.0
+    if where in ("right", "bottom"):
+        return float(extent - size)
+    return 0.0
+
+
+def annotate_args(segments, x, baseline, pointsize, opts, measurer):
+    """Draw one line, one -annotate per segment at its own x.
+
+    Each segment carries its own face and color, so unlike a single-font line
+    there is nothing to overlay or copy: the x offsets come from the same
+    engine that draws the glyphs.
+    """
+    kerning = measurer.kerning(pointsize)
+    args = []
+    offsets = measurer.offsets(segments, pointsize)
+    for (text, is_accent), (dx, _) in zip(segments, offsets):
+        drawn, shift = measurer.drawable(text, is_accent, pointsize)
+        if not drawn:
+            continue
+        fill = opts.accent_color if is_accent else opts.color
+        args += [
+            "-font",
+            measurer.font_for(is_accent),
+            "-pointsize",
+            f"{pointsize:g}",
+            "-kerning",
+            f"{kerning:g}",
+            "-fill",
+            fill,
+        ]
+        # Stroking a glyph in its own fill color fattens every stem, which is
+        # the only way to get more weight out of a face whose bold is already
+        # its heaviest cut. Half the stroke lands outside the outline, so the
+        # ink grows by stroke/2 in every direction.
+        if opts.stroke > 0:
+            args += ["-stroke", fill, "-strokewidth", f"{opts.stroke:g}"]
+        else:
+            args += ["-stroke", "none"]
+        args += ["-annotate", f"{x + dx + shift:+.0f}{baseline:+.0f}", drawn]
+    return args
+
+
+def layout_records(lines, placements, pointsize, opts, measurer):
+    """The same placements `annotate_args` draws, as data.
+
+    This walks the segments in the same order, applies the same offsets and the
+    same leading-space shift, and rounds x the way `-annotate` does, so a
+    consumer of the JSON puts every segment where the PNG has it. Anything that
+    reproduces the placement arithmetic instead of sharing it would drift the
+    first time the measurer changed.
+    """
+    out = []
+    for segments, (x, baseline) in zip(lines, placements):
+        offsets = measurer.offsets(segments, pointsize)
+        drawn = []
+        for (text, is_accent), (dx, _) in zip(segments, offsets):
+            glyphs, shift = measurer.drawable(text, is_accent, pointsize)
+            if not glyphs:
+                continue
+            drawn.append({
+                "text": glyphs,
+                # -annotate takes '%+.0f', so the raster lands on the integer.
+                "x": int(round(x + dx + shift)),
+                "accent": is_accent,
+                "font": measurer.font_for(is_accent),
+                "fill": opts.accent_color if is_accent else opts.color,
+            })
+        out.append({"baseline": int(round(baseline)), "segments": drawn})
+    return out
+
+
+def dump_layout(path, lines, placements, box, pointsize, opts, measurer):
+    """Write everything a non-ImageMagick renderer needs to set the same type."""
+    box_w, box_h = box
+    doc = {
+        "box": {"width": box_w, "height": box_h},
+        "pointsize": pointsize,
+        "line_height": opts.line_height,
+        "tracking": opts.tracking,
+        # ImageMagick's kerning is an absolute advance added between glyphs;
+        # CSS letter-spacing is the same quantity, so pass it in pixels.
+        "letter_spacing": round(measurer.kerning(pointsize), 4),
+        "stroke": opts.stroke,
+        "fonts": {
+            "body": font_record(opts.font),
+            "accent": font_record(opts.accent_font),
+        },
+        "lines": layout_records(lines, placements, pointsize, opts, measurer),
+    }
+    with open(path, "w") as fh:
+        json.dump(doc, fh, indent=2)
+        fh.write("\n")
+    return doc
+
+
+def render_block(lines, placements, canvas_w, canvas_h, pointsize, opts, measurer, path):
+    """Draw the lines on a transparent canvas of the given size."""
+    args = ["magick", "-size", f"{canvas_w}x{canvas_h}", "xc:none"]
+    for segments, (x, baseline) in zip(lines, placements):
+        args += annotate_args(segments, x, baseline, pointsize, opts, measurer)
+    run(args + [path])
+    return path
+
+
+SHADOW_RE = re.compile(
+    r"^(\d+(?:\.\d+)?)x(\d+(?:\.\d+)?)(?:([+-]\d+(?:\.\d+)?)([+-]\d+(?:\.\d+)?))?$"
+)
+
+
+def parse_shadow(spec, pointsize):
+    """Return (opacity, sigma, dx, dy). 'auto' scales with the type, so a
+    shadow tuned at one size still looks the same at another."""
+    if spec == "auto":
+        return 55.0, 0.035 * pointsize, 0.0, 0.025 * pointsize
+    match = SHADOW_RE.match(spec)
+    if not match:
+        die(f"invalid --shadow {spec!r}; expected OPACITYxSIGMA+DX+DY, e.g. 55x10+0+7")
+    opacity, sigma, dx, dy = match.groups()
+    opacity, sigma = float(opacity), float(sigma)
+    if opacity > 100:
+        die(f"--shadow opacity must be 0-100, got {opacity:g}")
+    return opacity, sigma, float(dx or 0), float(dy or 0)
+
+
+def apply_shadow(block, canvas_w, canvas_h, spec, color, pointsize, work):
+    """Drop a shadow behind the block, on a canvas of the same size.
+
+    The type does not move: the shadow is drawn from the block's own alpha
+    channel, offset and blurred underneath it. Blur that runs off the canvas is
+    clipped, which is why the type wants a little air inside the box.
+
+    ImageMagick's own -shadow is avoided here because it resizes and re-origins
+    the image, and recovering the type's position from the result is guesswork.
+    """
+    opacity, sigma, dx, dy = parse_shadow(spec, pointsize)
+    if opacity == 0:
+        return block
+
+    alpha = os.path.join(work, "shadow-alpha.png")
+    shape = os.path.join(work, "shadow-shape.png")
+    shadow = os.path.join(work, "shadow.png")
+    out = os.path.join(work, "shadowed.png")
+
+    run(["magick", block, "-alpha", "extract", alpha])
+    blur = ["-blur", f"0x{sigma:g}"] if sigma > 0 else []
+    run(
+        [
+            "magick",
+            "-size",
+            f"{canvas_w}x{canvas_h}",
+            "xc:black",
+            alpha,
+            "-geometry",
+            f"{dx:+.0f}{dy:+.0f}",
+            "-compose",
+            "Copy",
+            "-composite",
+        ]
+        + blur
+        + ["-evaluate", "multiply", f"{opacity / 100.0:g}", shape]
+    )
+    run(
+        [
+            "magick",
+            "-size",
+            f"{canvas_w}x{canvas_h}",
+            f"xc:{color}",
+            shape,
+            "-compose",
+            "CopyOpacity",
+            "-composite",
+            # A black or gray shadow color makes an all-gray image, and
+            # compositing the colored block onto a grayscale base drops the
+            # accent color. -type is not enough: the PNG encoder re-detects
+            # grayscale from the pixels and writes it back out gray, so the
+            # color type has to be forced on the encoder itself.
+            "-colorspace",
+            "sRGB",
+            "-define",
+            "png:color-type=6",
+            shadow,
+        ]
+    )
+    run(["magick", shadow, block, "-compose", "Over", "-composite", out])
+    return out
+
+
+def render_uniform(lines, box_w, box_h, opts, measurer, work):
+    """One pointsize for every line, the largest that fits the box."""
+    # Slack around the type: one pixel for glyphs that paint a hair past their
+    # advance width, plus half the stroke, which lands outside the outline.
+    pad = int(math.ceil(opts.stroke / 2.0)) + 1
+    inner_w = max(box_w - 2 * pad, 1)
+    inner_h = max(box_h - 2 * pad, 1)
+
+    if opts.font_size:
+        pointsize = opts.font_size
+    else:
+        pointsize = solve_pointsize(lines, inner_w, inner_h, opts.line_height, measurer)
+
+    ascent, _ = measurer.face(pointsize)
+    advance = round(opts.line_height * pointsize)
+    widths = [measurer.line_width(s, pointsize) for s in lines]
+    height = block_height(lines, pointsize, opts.line_height, measurer)
+    top = pad + align_offset(height, inner_h, opts.valign)
+    placements = [
+        (pad + align_offset(w, inner_w, opts.align), top + ascent + i * advance)
+        for i, w in enumerate(widths)
+    ]
+
+    block = os.path.join(work, "block.png")
+    render_block(lines, placements, box_w, box_h, pointsize, opts, measurer, block)
+    # The slack is padding, not type. Overflow is judged on the ink: the
+    # measured text plus whatever the stroke adds to it.
+    ink_w = int(math.ceil(max(widths) + opts.stroke))
+    ink_h = int(math.ceil(height + opts.stroke))
+    return block, ink_w, ink_h, pointsize, placements
+
+
+def render_width(lines, box_w, box_h, opts, measurer, work):
+    """Each line trimmed to its ink and scaled to the box width, so the number
+    of characters in a line decides its cap height. Loud and uneven by design;
+    line-height and tracking stop meaning what CSS means by them here."""
+    pointsize = opts.font_size or 300
+    ascent, descent = measurer.face(pointsize)
+    pad = int(math.ceil(opts.stroke / 2.0)) + 1
+
+    parts = []
+    for i, segments in enumerate(lines):
+        width = measurer.line_width(segments, pointsize)
+        canvas_w = int(width) + 2 * pad
+        canvas_h = int(ascent + descent) + 2 * pad
+        raw = os.path.join(work, f"raw{i}.png")
+        render_block(
+            [segments],
+            [(float(pad), pad + ascent)],
+            canvas_w,
+            canvas_h,
+            pointsize,
+            opts,
+            measurer,
+            raw,
+        )
+        part = os.path.join(work, f"line{i}.png")
+        run(["magick", raw, "-trim", "+repage", "-resize", f"{box_w}x", part])
+        parts.append(part)
+
+    heights = [image_size(p)[1] for p in parts]
+    gap = (
+        opts.gap
+        if opts.gap is not None
+        else (opts.line_height - 1.0) * (sum(heights) / len(heights))
+    )
+
+    # Pad each line in its own invocation. -splice applies to every image in the
+    # list, so folding the pads into the append would double-pad the first line
+    # and leave the last one bare.
+    padded = [parts[0]]
+    for i, part in enumerate(parts[1:], start=1):
+        out = os.path.join(work, f"pad{i}.png")
+        run(
+            ["magick", part, "-background", "none", "-splice", f"0x{gap:.0f}", "+repage", out]
+        )
+        padded.append(out)
+
+    stack = os.path.join(work, "stack.png")
+    run(["magick"] + padded + ["-background", "none", "-append", "+repage", stack])
+
+    # Every line was trimmed to its ink, so here the stack is the ink.
+    # Each line was trimmed to its ink and rescaled on its own, so there is no
+    # one pointsize and no set of baselines to report. --dump-layout refuses.
+    stack_w, stack_h = image_size(stack)
+    x = int(round(align_offset(stack_w, box_w, opts.align)))
+    y = int(round(align_offset(stack_h, box_h, opts.valign)))
+    block = os.path.join(work, "block.png")
+    run(
+        [
+            "magick",
+            "-size",
+            f"{box_w}x{box_h}",
+            "xc:none",
+            stack,
+            "-geometry",
+            f"{x:+d}{y:+d}",
+            "-compose",
+            "Over",
+            "-composite",
+            block,
+        ]
+    )
+    return block, stack_w, stack_h, pointsize, None
+
+
+# ------------------------------------------------------------------------- cli
+
+
+def parse_box(s):
+    match = BOX_RE.match(s)
+    if not match:
+        if re.search(r"[+-]\d", s):
+            die(
+                f"invalid --box {s!r}; the box is the whole canvas now, so it "
+                "takes a size only: WxH, e.g. 2220x1050. Place the result when "
+                "you composite it."
+            )
+        die(f"invalid --box {s!r}; expected WxH, e.g. 2220x1050")
+    box = (int(match.group(1)), int(match.group(2)))
+    if box[0] <= 0 or box[1] <= 0:
+        die(f"--box must have positive width and height, got {s!r}")
+    return box
+
+
+def resolve_font(name):
+    """Fail here rather than let ImageMagick quietly substitute another face.
+    A silently substituted font produces output that looks fine and is wrong."""
+    if os.path.isfile(name):
+        return name
+    out = capture(["magick", "-list", "font"])
+    known = re.findall(r"^\s*Font:\s*(\S+)\s*$", out.stdout, re.MULTILINE)
+    if name in known:
+        return name
+    hint = ""
+    matches = [f for f in known if name.lower() in f.lower()]
+    if matches:
+        hint = f"; did you mean {matches[0]!r}?"
+    die(f"font not found: {name!r}{hint}")
+
+
+FONT_RECORD_RE = re.compile(
+    r"^\s*Font:\s*(\S+)\s*$\n"
+    r"\s*family:\s*(.*?)\s*$\n"
+    r"\s*style:\s*(\S+)\s*$\n"
+    r"\s*stretch:\s*\S+\s*$\n"
+    r"\s*weight:\s*(\d+)\s*$",
+    re.MULTILINE,
+)
+
+
+def font_record(name):
+    """The family, style and weight ImageMagick has registered for a face.
+
+    A dump is only useful to something that does not go through ImageMagick,
+    and everything else in the world asks for a face by family and weight
+    rather than by ImageMagick's hyphenated name. Read the answer off the same
+    font list `resolve_font` validates against rather than guessing at it:
+    some weights register as their own family (`IBM Plex Mono Medium` at
+    weight 500, not `IBM Plex Mono` at 500) and splitting the hyphenated name
+    would get those wrong.
+    """
+    out = capture(["magick", "-list", "font"])
+    for font, family, style, weight in FONT_RECORD_RE.findall(out.stdout):
+        if font == name:
+            return {
+                "name": name,
+                "family": family,
+                "style": style.lower(),
+                "weight": int(weight),
+            }
+    die(f"no font record for {name!r}; --dump-layout needs a face "
+        "ImageMagick has registered, not a TTF path")
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="headline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Set a headline into a box on a transparent canvas, in the "
+        "michaelgreenly.dev display style.",
+        epilog=(
+            "accent:\n"
+            "  Wrap a word or phrase in asterisks to set it in the accent face and\n"
+            "  color: -t '*ai* has changed'. Use \\* for a literal asterisk.\n\n"
+            "--box takes a size, WxH. The output is a PNG exactly that size with a\n"
+            "  transparent background and nothing in it but the type; composite it\n"
+            "  onto a plate yourself.\n\n"
+            "--fit uniform (default) solves one pointsize for every line: the largest\n"
+            "  at which the widest line fits the box width and the stacked block fits\n"
+            "  the box height. This is the site's rule rendered faithfully.\n"
+            "--fit width scales each line separately to the box width, so a short line\n"
+            "  comes out large and a long one small. Louder, less faithful.\n\n"
+            "Sizes come from the faces' ascent and descent, not from the ink of the\n"
+            "letters typed, so the same box and size put the baselines in the same\n"
+            "place no matter what the copy says.\n\n"
+            "examples:\n"
+            "  headline out.png --box 2220x1050 \\\n"
+            "    -t '*ai* has changed' -t 'the math' -t 'of custom software'\n"
+            "  headline out.png --box 1200x600 -t 'ship it' --align center --show-box"
+        ),
+    )
+    p.add_argument("output", help="destination PNG")
+    p.add_argument(
+        "-t",
+        "--text",
+        action="append",
+        metavar="LINE",
+        help="one line of the headline; repeat in order",
+    )
+    p.add_argument("--box", required=True, help="canvas size WxH")
+    p.add_argument(
+        "--lines",
+        type=int,
+        default=None,
+        metavar="N",
+        help="rebreak the copy into exactly N lines, as evenly as the measured "
+             "widths allow; any line breaks in the -t text are discarded",
+    )
+    p.add_argument(
+        "--fit",
+        choices=("uniform", "width"),
+        default="uniform",
+        help="how lines are sized (default uniform)",
+    )
+    p.add_argument(
+        "--font-size",
+        type=int,
+        default=None,
+        metavar="N",
+        help="pin the pointsize, bypassing the solve",
+    )
+    p.add_argument(
+        "--case",
+        choices=("upper", "none"),
+        default="none",
+        help="case transform, applied after accent parsing (default none: "
+        "text is set exactly as entered)",
+    )
+    p.add_argument(
+        "--align",
+        choices=("left", "center", "right"),
+        default="left",
+        help="horizontal placement of lines in the box (default left)",
+    )
+    p.add_argument(
+        "--valign",
+        choices=("top", "middle", "bottom"),
+        default="middle",
+        help="vertical placement of the block in the box (default middle)",
+    )
+    p.add_argument(
+        "--line-height",
+        type=float,
+        default=LINE_HEIGHT,
+        help=f"line advance as a multiple of the pointsize (default {LINE_HEIGHT})",
+    )
+    p.add_argument(
+        "--tracking",
+        type=float,
+        default=TRACKING,
+        help=f"letter spacing in em (default {TRACKING})",
+    )
+    p.add_argument(
+        "--gap",
+        type=float,
+        default=None,
+        metavar="PX",
+        help="--fit width only: pixels between lines (default: from --line-height)",
+    )
+    p.add_argument(
+        "--shadow",
+        nargs="?",
+        const="auto",
+        default="auto",
+        metavar="OPACITYxSIGMA+DX+DY",
+        help="drop a shadow behind the type; on by default, scaled to the "
+        "solved pointsize. Give a spec like 55x10+0+7 in pixels to override it, "
+        "or --no-shadow to turn it off",
+    )
+    p.add_argument(
+        "--no-shadow",
+        action="store_const",
+        const=None,
+        dest="shadow",
+        help="disable the default drop shadow",
+    )
+    p.add_argument(
+        "--shadow-color",
+        default="#000000",
+        help="shadow color (default #000000)",
+    )
+    p.add_argument(
+        "--stroke",
+        type=float,
+        default=0.0,
+        metavar="PX",
+        help="stroke the glyphs in their own color to fake a heavier weight; "
+        "both faces ship their heaviest cut as their bold, so this is the only "
+        "way to go further (default 0)",
+    )
+    p.add_argument("--color", default=COLOR, help=f"body text color (default {COLOR})")
+    p.add_argument(
+        "--accent-color",
+        default=ACCENT_COLOR,
+        help=f"accent color (default {ACCENT_COLOR})",
+    )
+    p.add_argument(
+        "--font",
+        default=FONT,
+        help=f"body face: fontconfig name or path to a TTF (default {FONT})",
+    )
+    p.add_argument(
+        "--accent-font",
+        default=ACCENT_FONT,
+        help=f"face for *accented* words (default {ACCENT_FONT})",
+    )
+    p.add_argument(
+        "--allow-overflow",
+        action="store_true",
+        help="warn instead of failing when the block does not fit the box",
+    )
+    p.add_argument(
+        "--dump-layout",
+        default=None,
+        metavar="PATH",
+        help="also write the solved type layout to PATH as JSON: the "
+        "pointsize, and every segment's face, color, x and baseline. This is "
+        "what lets `layered` set the same type as live text in an SVG. "
+        "--fit uniform only",
+    )
+    p.add_argument(
+        "--show-box",
+        action="store_true",
+        help="outline the box in the output and report the solved size on stderr",
+    )
+    p.add_argument(
+        "--force", action="store_true", help="overwrite output if it already exists"
+    )
+    return p
+
+
+def main():
+    parser = build_parser()
+    # Treat signed values like -0.02 as argument values, not flags.
+    parser._negative_number_matcher = re.compile(r"^-\.?\d")
+    args = parser.parse_args()
+
+    if shutil.which("magick") is None:
+        die("ImageMagick `magick` not found on PATH")
+
+    if not args.text:
+        die("at least one -t/--text line is required")
+
+    for raw in args.text:
+        if ESCAPE_RE.search(raw):
+            die(
+                f"text contains an ImageMagick escape sequence: {raw!r}; "
+                "a '%' followed by a letter or '[' would be expanded"
+            )
+        if raw.startswith("@"):
+            die(f"text must not start with '@': {raw!r}; ImageMagick reads it as a file")
+
+    if os.path.splitext(args.output)[1].lower() in OPAQUE_SUFFIXES:
+        die(
+            f"output {args.output!r} has no alpha channel; the canvas is "
+            "transparent, so write a PNG"
+        )
+    if os.path.exists(args.output) and not args.force:
+        die(f"output exists (use --force to overwrite): {args.output!r}")
+    if args.dump_layout and os.path.abspath(args.dump_layout) == os.path.abspath(
+            args.output):
+        die("--dump-layout and the output are the same file; the layout "
+            "describes the PNG, it does not replace it")
+    if (args.dump_layout and os.path.exists(args.dump_layout)
+            and not args.force):
+        die(f"--dump-layout target exists (use --force to overwrite): "
+            f"{args.dump_layout!r}")
+
+    if args.font_size is not None and args.font_size <= 0:
+        die(f"--font-size must be positive, got {args.font_size}")
+    if args.line_height <= 0:
+        die(f"--line-height must be positive, got {args.line_height}")
+    if args.stroke < 0:
+        die(f"--stroke must not be negative, got {args.stroke}")
+
+    args.font = resolve_font(args.font)
+    args.accent_font = resolve_font(args.accent_font)
+
+    box_w, box_h = parse_box(args.box)
+
+    lines = [apply_case(parse_line(raw), args.case) for raw in args.text]
+    for raw, segments in zip(args.text, lines):
+        if not segments:
+            die(f"empty text line: {raw!r}")
+
+    measurer = Measurer(args.font, args.accent_font, args.tracking)
+
+    if args.lines is not None:
+        if args.lines < 1:
+            die(f"--lines must be at least 1, got {args.lines}")
+        lines = balance_lines(words_from(lines), args.lines, measurer)
+
+    with tempfile.TemporaryDirectory(prefix="headline.") as work:
+        render = render_uniform if args.fit == "uniform" else render_width
+        block, ink_w, ink_h, pointsize, placements = render(
+            lines, box_w, box_h, args, measurer, work
+        )
+
+        overflow = []
+        if ink_w > box_w:
+            overflow.append(f"{ink_w - box_w}px wider")
+        if ink_h > box_h:
+            overflow.append(f"{ink_h - box_h}px taller")
+        if overflow:
+            message = (
+                f"block is {' and '.join(overflow)} than the {box_w}x{box_h} box "
+                f"at pointsize {pointsize}, and is clipped by the canvas"
+            )
+            if not args.allow_overflow:
+                die(f"{message} (use --allow-overflow to render anyway)")
+            print(f"headline: warning: {message}", file=sys.stderr)
+
+        if args.show_box:
+            print(
+                f"headline: box {box_w}x{box_h} block {ink_w}x{ink_h} "
+                f"pointsize {pointsize}",
+                file=sys.stderr,
+            )
+
+        # After the overflow check, so a run that refuses to render leaves no
+        # layout file behind claiming to describe one.
+        if args.dump_layout:
+            if placements is None:
+                die("--dump-layout needs --fit uniform; --fit width scales "
+                    "every line separately, so there is no one pointsize and "
+                    "no set of baselines to describe")
+            dump_layout(args.dump_layout, lines, placements,
+                        (box_w, box_h), pointsize, args, measurer)
+
+        if args.shadow is not None:
+            block = apply_shadow(
+                block, box_w, box_h, args.shadow, args.shadow_color, pointsize, work
+            )
+
+        outline = []
+        if args.show_box:
+            outline = [
+                "-fill",
+                "none",
+                "-stroke",
+                args.accent_color,
+                "-strokewidth",
+                "3",
+                "-draw",
+                f"rectangle 1,1 {box_w - 2},{box_h - 2}",
+                "-stroke",
+                "none",
+            ]
+
+        run(["magick", block] + outline + [args.output])
+
+
+if __name__ == "__main__":
+    main()

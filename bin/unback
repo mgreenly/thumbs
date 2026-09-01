@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Remove the studio backdrop from a portrait, leaving the subject on
+transparency.
+
+    unback ~/Pictures/Thumbs/face.png face-cut.png
+
+The matte comes from a segmentation model (rembg / ONNX Runtime, running
+locally on the CPU), not from a color threshold. A fuzz-and-floodfill matte
+keyed off the backdrop looks tempting for a seamless cloth, but the cloth is
+lit with a gradient that spans roughly #BCB9BC to #FFFFFF, and that range
+overlaps the subject's own highlights. At the tolerance needed to clear the
+darkest corner, the fill leaks through the hair into the face. The model does
+not care about any of that, and it holds the hair edge, which is the part a
+threshold can never get right.
+
+Nothing is uploaded. The model weights are downloaded once, on first use of
+each model, to ~/.rembg/models/.
+
+The raw model mask is used as-is by default. Alpha matting (--matting) can
+refine the partial coverage of individual hair strands, but on a gesturing
+subject over this bright cloth it tends to re-solve solid limbs — a raised
+finger especially — as semi-transparent, and to leave a translucent halo of
+retained backdrop. birefnet-portrait already cuts a clean hard edge without it,
+so matting is opt-in rather than the default.
+
+The mask still leaves a faint light rim along the top of the hair, where a
+pixel is genuinely part backdrop and the backdrop is brighter than anything it
+will be composited over. There is no correct alpha for those pixels, so the
+matte is eroded a few px inward afterwards, trading a sliver of hair for a
+clean edge. See --shrink.
+"""
+
+import argparse
+import os
+import sys
+
+# Model weights are 170MB-930MB each and are fetched on first use.
+MODELS = {
+    "isnet-general-use": "general segmentation; clean hair but drops gestures (~7s)",
+    "u2net_human_seg": "trained on people; slightly harder hair edge (~6s)",
+    "birefnet-portrait": "portrait specialist; slowest but holds a raised hand (~43s)",
+    "u2net": "the rembg default; general purpose",
+}
+# birefnet-portrait is the default because it is the only model here that keeps
+# a gesturing hand — a pointing finger over the bright cloth — intact. It is the
+# slowest, which is the price of not lopping the subject's hand off.
+DEFAULT_MODEL = "birefnet-portrait"
+
+# Px of matte erosion. Chosen by eye on a 3840x2160 frame: at 6 the light rim
+# along the hair is gone and the hair still reads; by 10 the silhouette starts
+# to look nibbled. Scale it if the source is not roughly 4K.
+DEFAULT_SHRINK = 6
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+VENV_PYTHON = os.path.join(ROOT, ".venv", "bin", "python")
+
+
+def die(msg):
+    print(f"unback: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def ensure_rembg():
+    """rembg is heavy, so it lives in the project venv rather than in the
+    system interpreter. Re-exec there once, then fail loudly if it is missing."""
+    try:
+        import rembg  # noqa: F401
+
+        return
+    except ImportError:
+        pass
+
+    if os.environ.get("UNBACK_REEXEC") != "1" and os.path.exists(VENV_PYTHON):
+        os.environ["UNBACK_REEXEC"] = "1"
+        os.execv(VENV_PYTHON, [VENV_PYTHON, os.path.abspath(__file__)] + sys.argv[1:])
+
+    die(
+        "rembg is not installed. Create the project venv with:\n"
+        f"    python3 -m venv {os.path.join(ROOT, '.venv')}\n"
+        f"    {VENV_PYTHON} -m pip install 'rembg[cpu]' pillow"
+    )
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Remove the backdrop from a portrait, leaving transparency.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="models:\n"
+        + "\n".join(f"  {n:<20} {d}" for n, d in MODELS.items()),
+    )
+    p.add_argument("input", help="source image")
+    p.add_argument("output", help="destination PNG")
+    p.add_argument(
+        "-m",
+        "--model",
+        default=DEFAULT_MODEL,
+        help=f"segmentation model (default: {DEFAULT_MODEL})",
+    )
+    p.add_argument(
+        "--matting",
+        dest="matting",
+        action="store_true",
+        help="refine the raw mask with alpha matting; slower, and on a "
+        "gesturing subject can ghost a raised hand and leave a translucent halo",
+    )
+    p.add_argument(
+        "--foreground-threshold",
+        type=int,
+        default=270,
+        help="alpha-matting certain-foreground cutoff, 0-255 (default: 270)",
+    )
+    p.add_argument(
+        "--background-threshold",
+        type=int,
+        default=20,
+        help="alpha-matting certain-background cutoff, 0-255 (default: 20)",
+    )
+    p.add_argument(
+        "--erode-size",
+        type=int,
+        default=11,
+        help="width in px of the unknown band the matting solves (default: 11)",
+    )
+    p.add_argument(
+        "--shrink",
+        type=int,
+        default=DEFAULT_SHRINK,
+        help=f"erode the matte this many px to kill the light rim "
+        f"(default: {DEFAULT_SHRINK}; 0 disables, 10 is tighter still)",
+    )
+    p.add_argument(
+        "--trim",
+        action="store_true",
+        help="crop the result to the subject's bounding box",
+    )
+    args = p.parse_args()
+
+    if args.shrink < 0:
+        die(f"--shrink must not be negative, got {args.shrink}")
+    if args.model not in MODELS:
+        die(f"unknown model {args.model!r}; choose one of {', '.join(MODELS)}")
+    if not os.path.exists(args.input):
+        die(f"no such file: {args.input}")
+    if not args.output.lower().endswith(".png"):
+        die(f"output must be a PNG to carry transparency, got {args.output!r}")
+    return args
+
+
+def main():
+    args = parse_args()
+    ensure_rembg()
+
+    from PIL import Image, ImageFilter
+    from rembg import new_session, remove
+
+    src = Image.open(args.input).convert("RGBA")
+    session = new_session(args.model)
+
+    if args.matting:
+        cut = remove(
+            src,
+            session=session,
+            alpha_matting=True,
+            alpha_matting_foreground_threshold=args.foreground_threshold,
+            alpha_matting_background_threshold=args.background_threshold,
+            alpha_matting_erode_size=args.erode_size,
+        )
+    else:
+        cut = remove(src, session=session)
+
+    if args.shrink:
+        # A 3x3 minimum filter erodes by exactly 1px per pass, so N passes cost
+        # O(N) rather than the O(N^2) of one MinFilter(2N+1) window. Eroding the
+        # soft alpha rather than a binary mask keeps the edge feathered.
+        alpha = cut.getchannel("A")
+        for _ in range(args.shrink):
+            alpha = alpha.filter(ImageFilter.MinFilter(3))
+        cut.putalpha(alpha)
+
+    if args.trim:
+        box = cut.getchannel("A").getbbox()
+        if box is None:
+            die("the matte is empty; no subject was found")
+        cut = cut.crop(box)
+
+    cut.save(args.output)
+    print(f"{args.output}: {cut.width}x{cut.height}")
+
+
+if __name__ == "__main__":
+    main()

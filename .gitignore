@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Claude Code local settings (may hold secrets)
+.claude/settings.local.json
+
+# OS cruft
+.DS_Store

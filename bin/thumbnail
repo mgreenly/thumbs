@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""Build a finished thumbnail from a portrait and a headline, in one command.
+
+    thumbnail portrait.png --side left \\
+      -t 'I walk through how my *SPEC* harness works'
+
+    thumbnail portrait.png --side left \\
+      --item 'gather' --item '*build*' --item 'verify'
+
+This is the whole session in one line. It cuts the portrait, builds the plate,
+solves the headline into the largest empty space beside the subject, draws the
+banner, and writes both the flattened JPEG and the layered SVG into the
+portrait's own folder, numbered as the next `thumb-<n>`.
+
+The type layer is a headline (-t) or a numbered list (--item), never both. A
+list looks for a taller box, because a column of rows cannot fill the short wide
+one a three-line headline is happy with; --shape overrides that when a frame
+wants otherwise.
+
+Everything that can be a default is one: a neutral gray plate, the site URL in
+the banner, the house type, the drop shadow, birefnet for the cut, and the
+headline box computed from this frame's negative space (see `freebox`). The two
+things the operator actually varies are exposed:
+
+  --side left|right   which side the subject stands on
+  --subject-inset F   push the subject further into its corner, which is how you
+                      give the headline more room (smaller) or less (larger)
+
+and the type can be re-faced with --font / --accent-font. Anything past that,
+drop down to the individual tools; this wraps them, it does not replace them.
+
+The plate is a generated gradient unless `--background` names a photograph, and
+there is nothing between the plate and the subject unless `--stage` asks for a
+shape. A stage is what a cut-out's halo needs when the plate is busy: a flat
+field of a color near the fringe, with a ring around it so it still reads as a
+shape. It is independent of `--framing`, which is the share of the frame the
+portrait itself takes; the two are tuned against each other rather than one
+being derived from the other.
+
+The portrait is cut once to `<stem>-cut.png` beside it and reused on later
+runs; pass --recut to force it (birefnet is slow). Nothing is overwritten: each
+run takes the next free number, so attempts accumulate.
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+BIN = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, BIN)
+
+import thumblayout
+
+BANNER_DEFAULT = "https://michaelgreenly.dev"
+
+
+def die(msg):
+    print(f"thumbnail: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def run(cmd):
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        die(f"step failed: {' '.join(str(c) for c in cmd)}")
+
+
+def capture(cmd):
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        die(result.stderr.strip() or f"step failed: {' '.join(cmd)}")
+    return result.stdout
+
+
+def next_number(folder):
+    """The next unused attempt number, so attempts accumulate and never
+    overwrite. Counts every numbered artifact, not just the finished JPEG, so a
+    run that died partway (leaving orphan `<n>-backdrop.png` and the like) does
+    not hand the next run a colliding number."""
+    used = []
+    for name in os.listdir(folder):
+        m = (re.fullmatch(r"thumb-(\d+)\.(?:jpg|svg)", name)
+             or re.fullmatch(
+                 r"(\d+)-(?:backdrop|stage|headline|banner)\.(?:png|json)",
+                 name))
+        if m:
+            used.append(int(m.group(1)))
+    return (max(used) + 1) if used else 1
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="thumbnail",
+        description="Build a finished thumbnail from a portrait and a headline.",
+    )
+    p.add_argument("portrait", help="the portrait frame, background intact")
+    p.add_argument("-t", "--headline", metavar="COPY",
+                   help="headline copy; *word* is an accent (default: no "
+                        "headline)")
+    p.add_argument("--item", action="append", metavar="COPY",
+                   help="one row of a numbered list; repeat in order. Sets the "
+                        "type layer as a list instead of a headline, so it "
+                        "cannot be combined with -t")
+    p.add_argument("--start", type=int, default=None, metavar="N",
+                   help="number the first list row N (default 1); --item only")
+    p.add_argument("--shape", choices=("wide", "tall"), default=None,
+                   help="the shape of box to look for: 'tall' for a list, "
+                        "'wide' for a headline. Defaults to whichever suits "
+                        "the layer you asked for")
+    p.add_argument("--side", choices=("left", "right"), default="right",
+                   help="which side the subject stands on (default right)")
+    p.add_argument("--lines", type=int, default=3,
+                   help="rebreak the headline into this many lines (default 3)")
+    p.add_argument("--subject-inset", type=float, default=None, metavar="FRAC",
+                   help="subject center as a fraction of width from its side; "
+                        "smaller gives the headline more room (default 0.26)")
+    p.add_argument("--mirror", action="store_true",
+                   help="flip the subject horizontally")
+    p.add_argument("--font", default=None, help="headline body face")
+    p.add_argument("--accent-font", default=None, help="headline accent face")
+    p.add_argument("--banner", default=BANNER_DEFAULT, metavar="COPY",
+                   help=f"banner copy (default {BANNER_DEFAULT})")
+    p.add_argument("--tint", default=None,
+                   help="backdrop tint hex; omit for a neutral gray wall")
+    p.add_argument("--strength", default="0.20",
+                   help="backdrop tint strength 0-1 (default 0.20)")
+    p.add_argument("--background", default=None, metavar="PATH",
+                   help="use this photograph as the plate instead of the "
+                        "generated gradient; cover-cropped to the canvas")
+    p.add_argument("--framing", choices=tuple(thumblayout.FRAMINGS),
+                   default=None,
+                   help="the share of the frame the portrait takes: 'full' is "
+                        "the half-frame subject, a fraction is one of the "
+                        "smaller ones (default full). Says nothing about the "
+                        "stage")
+    p.add_argument("--stage", choices=("circle",), default=None,
+                   help="draw a shape behind the subject for the cut-out edge "
+                        "to sit against (default: none)")
+    p.add_argument("--stage-fill", default=None, metavar="COLOR",
+                   help="the stage's flat field; near the plate is what hides "
+                        "the halo (default: a neutral just off the wall)")
+    p.add_argument("--stage-ring", default=None, metavar="COLOR",
+                   help="the stage's border color (default #18181B)")
+    p.add_argument("--recut", action="store_true",
+                   help="re-run the cut even if <stem>-cut.png already exists")
+    args = p.parse_args()
+
+    if args.headline and args.item:
+        die("-t and --item both write the type layer; a frame has one of them")
+    if args.start is not None and not args.item:
+        die("--start numbers list rows; pass --item too")
+    for value, flag in ((args.stage_fill, "--stage-fill"),
+                        (args.stage_ring, "--stage-ring")):
+        if value is not None and not args.stage:
+            die(f"{flag} colors a layer that is not there; pass --stage too")
+
+    if not os.path.exists(args.portrait):
+        die(f"no such portrait: {args.portrait}")
+    folder = os.path.dirname(os.path.abspath(args.portrait))
+
+    stem = os.path.splitext(os.path.basename(args.portrait))[0]
+    cut = os.path.join(folder, f"{stem}-cut.png")
+    if args.recut or not os.path.exists(cut):
+        run([os.path.join(BIN, "unback"), args.portrait, cut])
+
+    n = next_number(folder)
+    d = lambda name: os.path.join(folder, name)
+    backdrop = d(f"{n}-backdrop.png")
+    stage = d(f"{n}-stage.png")
+    stage_json = d(f"{n}-stage.json")
+    headline = d(f"{n}-headline.png")
+    headline_json = d(f"{n}-headline.json")
+    banner = d(f"{n}-banner.png")
+    banner_json = d(f"{n}-banner.json")
+    jpg = d(f"thumb-{n}.jpg")
+    svg = d(f"thumb-{n}.svg")
+
+    # The framing is resolved once, here, and then passed to every tool that
+    # places the subject. They each have the same default, but a default agreed
+    # on in three places is a disagreement waiting to happen.
+    framing = args.framing or "full"
+
+    # Plate, banner, and canvas numbers come straight from the layout, exactly
+    # as the manual recipe eval's them.
+    g = thumblayout.compute(side=args.side, subject_inset=args.subject_inset,
+                            framing=framing)
+    canvas = f"{g['canvas']['width']}x{g['canvas']['height']}"
+    hx, hy = g["backdrop"]["hotspot"]
+    banner_box = f"{g['banner']['width']}x{g['banner']['height']}"
+
+    # These flags must be identical everywhere the subject is placed, or the
+    # measured shapes and the composite would disagree.
+    placement = ["--side", args.side, "--framing", framing]
+    if args.subject_inset is not None:
+        placement += ["--subject-inset", str(args.subject_inset)]
+    if args.mirror:
+        placement += ["--mirror"]
+
+    if args.background:
+        run([os.path.join(BIN, "backdrop"), backdrop, "--size", canvas,
+             "--image", args.background])
+    else:
+        backdrop_cmd = [os.path.join(BIN, "backdrop"), backdrop, "--size",
+                        canvas, "--strength", args.strength,
+                        "--hotspot", f"{hx},{hy}"]
+        if args.tint:
+            backdrop_cmd += ["--tint", args.tint]
+        run(backdrop_cmd)
+
+    if args.stage:
+        # The disc holds the whole visible subject, so its size is measured off
+        # this frame's matte rather than named: there is nothing to specify.
+        s = json.loads(capture(
+            [os.path.join(BIN, "freebox"), "--subject", cut,
+             "--find", "stage", "--format", "json"] + placement))
+        stage_cmd = [os.path.join(BIN, "stage"), stage, "--size", canvas,
+                     "--form", args.stage,
+                     "--center", f"{s['center_x']},{s['center_y']}",
+                     "--radius", str(s["radius"]), "--ring", str(s["ring"]),
+                     "--dump-layout", stage_json]
+        if args.stage_fill:
+            stage_cmd += ["--fill", args.stage_fill]
+        if args.stage_ring:
+            stage_cmd += ["--ring-color", args.stage_ring]
+        run(stage_cmd)
+
+    run([os.path.join(BIN, "banner"), banner, "--box", banner_box,
+         "-t", args.banner, "--dump-layout", banner_json])
+
+    # freebox takes --stage as a bare switch, because all it needs to know is
+    # that a disc is in the way; compose and layered are handed the layer.
+    freebox_placement = placement + (["--stage"] if args.stage else [])
+
+    have_headline = bool(args.headline or args.item)
+    geom = None
+    if have_headline:
+        # A list is a column of rows and a headline is a block of lines, so they
+        # want differently proportioned boxes out of the same negative space.
+        shape = args.shape or ("tall" if args.item else "wide")
+        box = json.loads(capture(
+            [os.path.join(BIN, "freebox"), "--subject", cut,
+             "--format", "json", "--shape", shape] + freebox_placement))
+        geom = f"{box['width']}x{box['height']}+{box['x']}+{box['y']}"
+
+        # Both generators write the headline layer, take the same box, and dump
+        # the same kind of layout, so everything downstream is untouched.
+        tool = "list" if args.item else "headline"
+        head_cmd = [os.path.join(BIN, tool), headline,
+                    "--box", f"{box['width']}x{box['height']}",
+                    "--align", box["align"], "--valign", box["valign"],
+                    "--dump-layout", headline_json]
+        if args.item:
+            for item in args.item:
+                head_cmd += ["-t", item]
+            if args.start is not None:
+                head_cmd += ["--start", str(args.start)]
+        else:
+            head_cmd += ["--lines", str(args.lines), "-t", args.headline]
+        if args.font:
+            head_cmd += ["--font", args.font]
+        if args.accent_font:
+            head_cmd += ["--accent-font", args.accent_font]
+        run(head_cmd)
+
+    compose_cmd = [os.path.join(BIN, "compose"), jpg,
+                   "--backdrop", backdrop, "--subject", cut,
+                   "--banner", banner] + placement
+    layered_cmd = [os.path.join(BIN, "layered"), svg,
+                   "--backdrop", backdrop, "--subject", cut,
+                   "--banner", banner, "--banner-layout", banner_json] + placement
+    if args.stage:
+        compose_cmd += ["--stage", stage]
+        layered_cmd += ["--stage", stage, "--stage-layout", stage_json]
+    if have_headline:
+        compose_cmd += ["--headline", headline, "--headline-box", geom]
+        layered_cmd += ["--headline", headline, "--headline-box", geom,
+                        "--headline-layout", headline_json]
+    run(compose_cmd)
+    run(layered_cmd)
+
+    print(jpg)
+
+
+if __name__ == "__main__":
+    main()

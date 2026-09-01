@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+"""Write the same composition `compose` flattens, as a layered SVG.
+
+    layered thumb.svg --side right \\
+      --backdrop plate.png --subject face-cut.png \\
+      --headline head.png --banner bar.png \\
+      --headline-layout head.json --banner-layout bar.json
+
+The arguments are `compose`'s, because this is the same composition: the same
+layers, from the same layout, at the same offsets. What differs is the output.
+`compose` stacks the layers into one raster and downsamples it; this writes an
+SVG in which each layer is a named Inkscape layer that can still be moved,
+recolored, or retyped by hand.
+
+That makes it a hand-off, not a second renderer. The deliverable is still
+`compose`'s JPEG. This exists for the attempt where the composition is right
+but one word wants nudging, and opening a GUI beats another round of arguments.
+
+Type is the reason the file is worth having. Given the `--dump-layout` JSON
+that `headline` and `banner` can write alongside their PNGs, the copy comes out
+as live SVG text at the pointsize the solver picked, with each segment pinned
+to the x and baseline ImageMagick drew it at. Inkscape never gets to re-break
+or re-space a line, so the text is editable without being re-laid-out. Without
+those JSON files the layers are linked PNGs, which still gives a layered file,
+just not an editable one.
+
+The plate and the subject are always linked PNGs. The plate is a gradient with
+film grain in it, and the subject is a photograph; neither becomes anything
+better by being described in XML. Links, not embedded data, because the dated
+folder is the record and a 3MB base64 blob in the SVG would only make a second
+copy of a file already sitting next to it.
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from xml.sax.saxutils import escape, quoteattr
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import thumblayout
+
+SVG_NS = "http://www.w3.org/2000/svg"
+XLINK_NS = "http://www.w3.org/1999/xlink"
+INKSCAPE_NS = "http://www.inkscape.org/namespaces/inkscape"
+SODIPODI_NS = "http://sodipodi.sourceforge.net/DTD/sodipodi-0.0.dtd"
+
+
+def die(msg):
+    print(f"layered: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def capture(cmd):
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        die(result.stderr.strip() or f"command failed: {' '.join(cmd)}")
+    return result.stdout.strip()
+
+
+def image_size(path):
+    out = capture(["magick", "identify", "-format", "%w %h", path + "[0]"])
+    try:
+        w, h = (int(v) for v in out.split())
+    except ValueError:
+        die(f"could not read the size of {path}")
+    return w, h
+
+
+def trim_box(path):
+    """(full size, trimmed box) for a cutout, as `compose -trim` would find it.
+
+    The cutout arrives as a full frame that is mostly transparent, so its own
+    canvas says nothing about where the subject is. `compose` trims to the ink
+    and places that; SVG has no trim, so the same bounding box is measured here
+    and turned into an offset on the untrimmed image instead.
+    """
+    out = capture(["magick", "identify", "-format", "%w %h %@", path + "[0]"])
+    m = re.fullmatch(r"(\d+) (\d+) (\d+)x(\d+)([+-]\d+)([+-]\d+)", out)
+    if not m:
+        die(f"could not measure the trim box of {path}; identify said {out!r}")
+    full = (int(m.group(1)), int(m.group(2)))
+    box = tuple(int(v) for v in m.groups()[2:])
+    return full, box
+
+
+def parse_size(s):
+    m = re.fullmatch(r"(\d+)x(\d+)", s.strip())
+    if not m:
+        die(f"--export takes a WxH size, got {s!r}")
+    return int(m.group(1)), int(m.group(2))
+
+
+def parse_geom(s):
+    m = re.fullmatch(r"(\d+)x(\d+)\+(\d+)\+(\d+)", s.strip())
+    if not m:
+        die(f"--headline-box takes a WxH+X+Y geometry, got {s!r}")
+    w, h, x, y = (int(v) for v in m.groups())
+    return {"width": w, "height": h, "x": x, "y": y}
+
+
+def check_box(got, expected, label, side, what):
+    """Fail loudly when a layer was not built at the size this layout wants."""
+    want = (expected["width"], expected["height"])
+    if got != want:
+        die(f"{label} {what} is {got[0]}x{got[1]}, but the layout for "
+            f"--side {side} wants {want[0]}x{want[1]}. Rebuild it with "
+            f"--box {want[0]}x{want[1]} (see `layout --side {side}`).")
+
+
+def load_layout(path, expected, label, side):
+    with open(path) as fh:
+        doc = json.load(fh)
+    box = doc.get("box")
+    if not box:
+        die(f"{path} has no box; is it a --dump-layout file?")
+    check_box((box["width"], box["height"]), expected, label, side, path)
+    return doc
+
+
+# ------------------------------------------------------------------------ svg
+
+
+def attrs(pairs):
+    return "".join(f" {k}={quoteattr(str(v))}" for k, v in pairs if v is not None)
+
+
+def layer(label, body, indent="  "):
+    """One Inkscape layer. The groupmode/label pair is the whole difference
+    between a plain SVG group and something the layers dialog lists."""
+    head = attrs([
+        ("inkscape:groupmode", "layer"),
+        ("inkscape:label", label),
+        ("id", f"layer-{label}"),
+    ])
+    lines = [f"{indent}<g{head}>"]
+    lines += [f"{indent}  {line}" for line in body]
+    lines.append(f"{indent}</g>")
+    return lines
+
+
+def image_element(href, x, y, w, h, mirror_about=None):
+    """A linked raster. `mirror_about` is the x of the axis to flip around,
+    which is how `compose --mirror` flops the trimmed subject in place."""
+    body = attrs([
+        ("href", href),
+        ("xlink:href", href),  # Inkscape 0.x and some renderers still read this
+        ("x", f"{x:g}"),
+        ("y", f"{y:g}"),
+        ("width", f"{w:g}"),
+        ("height", f"{h:g}"),
+        ("preserveAspectRatio", "none"),
+        ("image-rendering", "optimizeQuality"),
+    ])
+    if mirror_about is None:
+        return [f"<image{body}/>"]
+    return [
+        f'<g transform="translate({2 * mirror_about:g},0) scale(-1,1)">',
+        f"  <image{body}/>",
+        "</g>",
+    ]
+
+
+def text_elements(doc, dx=0, dy=0):
+    """The dumped type as live SVG text, one <text> per line.
+
+    Every segment carries its own absolute x, so the only thing SVG's own text
+    layout is left to decide is the advance between glyphs inside one segment,
+    which `letter-spacing` pins to the same kerning ImageMagick used. A line
+    cannot re-break and a word cannot drift into its neighbour.
+
+    The document's pointsize covers the whole block, because a headline has one.
+    A list has two: its markers are set smaller than its labels and share their
+    baselines, so a segment may carry its own size and spacing and overrides the
+    document's when it does.
+    """
+    faces = {rec["name"]: rec for rec in doc.get("fonts", {}).values()}
+    stroke = doc.get("stroke", 0) or 0
+    out = []
+    for line in doc["lines"]:
+        if not line["segments"]:
+            continue
+        head = attrs([
+            ("xml:space", "preserve"),
+            ("font-size", f"{doc['pointsize']:g}px"),
+            ("letter-spacing", f"{doc['letter_spacing']:g}px"),
+            ("stroke-width", f"{stroke:g}" if stroke else None),
+        ])
+        out.append(f"<text{head}>")
+        for seg in line["segments"]:
+            face = faces.get(seg["font"])
+            if not face:
+                die(f"no font record for {seg['font']!r} in the layout file")
+            if not face.get("family"):
+                die(f"{seg['font']!r} has no family in the layout file; SVG "
+                    "asks for a face by family and weight, not by path")
+            size = seg.get("pointsize")
+            spacing = seg.get("letter_spacing")
+            span = attrs([
+                ("x", seg["x"] + dx),
+                ("y", line["baseline"] + dy),
+                ("font-size", f"{size:g}px" if size else None),
+                ("letter-spacing",
+                 f"{spacing:g}px" if spacing is not None else None),
+                ("font-family", face["family"]),
+                ("font-weight", face["weight"]),
+                ("font-style", face["style"]),
+                ("fill", seg["fill"]),
+                # Stroking a glyph in its own fill is how `headline` fakes a
+                # heavier weight; SVG centres the stroke on the outline the
+                # same way ImageMagick does.
+                ("stroke", seg["fill"] if stroke else None),
+            ])
+            out.append(f"  <tspan{span}>{escape(seg['text'])}</tspan>")
+        out.append("</text>")
+    return out
+
+
+def circle_element(doc):
+    """The stage as a live circle, from `stage --dump-layout`.
+
+    A disc is three numbers and two colors, so unlike the plate and the subject
+    it loses nothing by being described in XML and gains everything: the shape
+    can be dragged, resized and recolored in the hand-off file. The stroke is
+    centered on the path in SVG exactly as it is in ImageMagick, so the same
+    half-ring offset puts the fill's edge in the same place.
+    """
+    ring = doc["ring"]
+    body = attrs([
+        ("cx", doc["center"]["x"]),
+        ("cy", doc["center"]["y"]),
+        ("r", f"{doc['radius'] + ring / 2.0:g}"),
+        ("fill", doc["fill"]),
+        ("stroke", doc["ring_color"] if ring else None),
+        ("stroke-width", ring if ring else None),
+    ])
+    return [f"<circle{body}/>"]
+
+
+def rect_element(box, fill):
+    body = attrs([
+        ("x", box["x"]), ("y", box["y"]),
+        ("width", box["width"]), ("height", box["height"]),
+        ("fill", fill),
+    ])
+    return [f"<rect{body}/>"]
+
+
+def document(canvas, export, layers):
+    w, h = canvas
+    ew, eh = export
+    head = attrs([
+        ("xmlns", SVG_NS),
+        ("xmlns:xlink", XLINK_NS),
+        ("xmlns:inkscape", INKSCAPE_NS),
+        ("xmlns:sodipodi", SODIPODI_NS),
+        # The page is the export size and the coordinates are the working
+        # canvas, so the file's natural render is the deliverable while every
+        # number inside it is the number `layout` prints.
+        ("width", f"{ew}px"),
+        ("height", f"{eh}px"),
+        ("viewBox", f"0 0 {w} {h}"),
+        ("version", "1.1"),
+    ])
+    lines = ['<?xml version="1.0" encoding="UTF-8"?>', f"<svg{head}>"]
+    lines.append('  <sodipodi:namedview inkscape:document-units="px"'
+                 ' units="px" showgrid="false"/>')
+    lines += layers
+    lines.append("</svg>")
+    return "\n".join(lines) + "\n"
+
+
+# ------------------------------------------------------------------------ cli
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="layered",
+        description="Write the composition as a layered SVG instead of a "
+                    "flattened raster.",
+    )
+    p.add_argument("output", help="destination SVG")
+    p.add_argument("--backdrop", required=True,
+                   help="the plate; its size sets the working canvas")
+    p.add_argument("--stage", default=None,
+                   help="the shape the subject stands in front of, from stage")
+    p.add_argument("--stage-layout", default=None, metavar="JSON",
+                   help="stage --dump-layout output; makes the shape a live "
+                        "SVG circle instead of a linked PNG")
+    p.add_argument("--subject", default=None,
+                   help="cut-out subject on transparency, from unback")
+    p.add_argument("--headline", default=None, help="type layer, from headline")
+    p.add_argument("--headline-box", default=None, metavar="WxH+X+Y",
+                   help="place the headline at this box instead of the fixed "
+                        "layout column, from freebox; must match compose")
+    p.add_argument("--banner", default=None, help="bottom bar, from banner")
+    p.add_argument("--headline-layout", default=None, metavar="JSON",
+                   help="headline --dump-layout output; makes the headline "
+                        "live text instead of a linked PNG")
+    p.add_argument("--banner-layout", default=None, metavar="JSON",
+                   help="banner --dump-layout output; makes the bar a rect "
+                        "and its copy live text instead of a linked PNG")
+    p.add_argument("--side", choices=("left", "right"), default="right",
+                   help="which side the subject stands on (default right)")
+    p.add_argument("--mirror", action="store_true",
+                   help="flip the subject horizontally, as compose does")
+    p.add_argument("--subject-inset", type=float, default=None, metavar="FRAC",
+                   help="override the subject's horizontal center, as compose "
+                        "does; must match the value given to compose "
+                        "(default 0.26)")
+    p.add_argument("--framing", choices=tuple(thumblayout.FRAMINGS), default=None,
+                   help="the share of the frame the portrait takes, as "
+                        "compose does (default full)")
+    p.add_argument("--subject-front", action="store_true",
+                   help="place the subject above the headline instead of below")
+    p.add_argument("--export", default=None,
+                   help="page size WxH (default: the layout's export size)")
+    p.add_argument("--force", action="store_true",
+                   help="overwrite the output if it exists")
+    args = p.parse_args()
+
+    if os.path.exists(args.output) and not args.force:
+        die(f"{args.output} exists; pass --force to overwrite")
+    for path, label in ((args.backdrop, "backdrop"), (args.stage, "stage"),
+                        (args.subject, "subject"),
+                        (args.headline, "headline"), (args.banner, "banner"),
+                        (args.stage_layout, "stage layout"),
+                        (args.headline_layout, "headline layout"),
+                        (args.banner_layout, "banner layout")):
+        if path and not os.path.exists(path):
+            die(f"{label} {path} does not exist")
+    if args.stage_layout and not args.stage:
+        die("--stage-layout describes a layer that is not there; "
+            "pass --stage too")
+    if args.headline_layout and not args.headline:
+        die("--headline-layout describes a layer that is not there; "
+            "pass --headline too")
+    if args.banner_layout and not args.banner:
+        die("--banner-layout describes a layer that is not there; "
+            "pass --banner too")
+
+    framing = args.framing or "full"
+
+    canvas = image_size(args.backdrop)
+    try:
+        g = thumblayout.compute(canvas=canvas, side=args.side,
+                                subject_inset=args.subject_inset,
+                                framing=framing)
+    except ValueError as e:
+        die(str(e))
+    if args.headline_box:
+        g["headline"] = parse_geom(args.headline_box)
+    export = parse_size(args.export) if args.export else (
+        g["export"]["width"], g["export"]["height"])
+
+    # hrefs are relative to the SVG, so the whole attempt stays portable as
+    # long as it stays in its dated folder, which is where it lives anyway.
+    here = os.path.dirname(os.path.abspath(args.output))
+
+    def href(path):
+        return os.path.relpath(os.path.abspath(path), here)
+
+    plate = layer("backdrop",
+                  image_element(href(args.backdrop), 0, 0, canvas[0], canvas[1]))
+
+    stage = []
+    if args.stage:
+        if args.stage_layout:
+            with open(args.stage_layout) as fh:
+                doc = json.load(fh)
+            if doc.get("form") != "circle":
+                die(f"{args.stage_layout} is a {doc.get('form')!r} stage, and "
+                    "only a circle can be drawn as SVG yet")
+            body = circle_element(doc)
+        else:
+            body = image_element(href(args.stage), 0, 0, canvas[0], canvas[1])
+        stage = layer("stage", body)
+
+    subject = []
+    if args.subject:
+        (fw, fh), (tw, th, tx, ty) = trim_box(args.subject)
+        # compose resizes the trimmed cutout to the layout's height; scaling
+        # the untrimmed image by the same factor and offsetting by the trim
+        # origin puts the ink in the same place without a trim step.
+        scale = g["subject"]["height"] / th
+        sw = round(tw * scale)
+        sx = g["subject"]["center_x"] - sw // 2
+        sy = g["subject"]["bottom"] - g["subject"]["height"]
+        subject = layer("subject", image_element(
+            href(args.subject),
+            sx - tx * scale, sy - ty * scale, fw * scale, fh * scale,
+            mirror_about=(sx + sw / 2.0) if args.mirror else None))
+
+    headline = []
+    if args.headline:
+        box = g["headline"]
+        if args.headline_layout:
+            doc = load_layout(args.headline_layout, box, "headline", args.side)
+            body = text_elements(doc, box["x"], box["y"])
+        else:
+            check_box(image_size(args.headline), box, "headline", args.side,
+                      args.headline)
+            body = image_element(href(args.headline), box["x"], box["y"],
+                                 box["width"], box["height"])
+        headline = layer("headline", body)
+
+    banner = []
+    if args.banner:
+        box = g["banner"]
+        if args.banner_layout:
+            doc = load_layout(args.banner_layout, box, "banner", args.side)
+            bar = doc["bar"]
+            body = rect_element(
+                {"x": bar["x"] + box["x"], "y": bar["y"] + box["y"],
+                 "width": bar["width"], "height": bar["height"]}, bar["fill"])
+            body += text_elements(doc, box["x"], box["y"])
+        else:
+            check_box(image_size(args.banner), box, "banner", args.side,
+                      args.banner)
+            body = image_element(href(args.banner), box["x"], box["y"],
+                                 box["width"], box["height"])
+        banner = layer("banner", body)
+
+    # Plate, stage, subject, headline, banner, bottom to top: compose's order,
+    # and in SVG document order is z order, so the file reads the same way.
+    layers = list(plate) + stage
+    if args.subject_front:
+        layers += headline + subject
+    else:
+        layers += subject + headline
+    layers += banner
+
+    with open(args.output, "w") as fh:
+        fh.write(document(canvas, export, layers))
+
+
+if __name__ == "__main__":
+    main()

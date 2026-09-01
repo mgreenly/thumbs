@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""Generate the plate a thumbnail is built on: a softly tinted gradient in the
+shape of the studio wall behind the subject.
+
+    backdrop plate.png --size 2560x1440 --tint '#2563EB' --hotspot 0.28,0.30
+
+The luminance envelope is not invented. It is measured off `face.png`, the raw
+studio frame: a bright hotspot that reads as pure white, falling away to about
+#BDBABD at the far corner. That is a range of roughly 70 levels across the whole
+diagonal, which is a much flatter wall than it looks like to the eye, and
+matching it is what lets a cut-out subject sit back down on a generated plate
+without looking pasted onto it.
+
+Color is one knob. `--tint` names a hue and `--strength` says how far to push
+it; the brightness structure never changes. Two consequences, both wanted: every
+plate on the channel has the same weight and the same falloff regardless of its
+color, and "make it a muted slate blue" is one argument rather than a
+color-matching exercise.
+
+The tint is applied unevenly on purpose. The shadowed end takes the full
+strength and the hot end takes a fraction of it, because that is what a lit wall
+does: the bright part washes out toward white and only the falloff shows the
+wall's own color. Tinting both ends equally gives a flat colored card instead.
+
+`--image` replaces the whole generated plate with a photograph, cover-cropped
+to the canvas:
+
+    backdrop plate.png --size 2560x1440 --image background.jpg
+
+Everything above stops applying when it does. The gradient's color knobs are
+refused rather than ignored, and the grain is not added, because a photograph
+already has its own. This stays here rather than becoming its own tool so that
+the plate has exactly one maker and `compose` never learns there are two kinds.
+"""
+
+import argparse
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+# The measured endpoints of the studio wall in face.png. HI is the hotspot, LO
+# is the far corner. See the module docstring.
+BASE_HI = (255, 255, 255)
+BASE_LO = (189, 186, 189)
+
+DEFAULT_SIZE = "2560x1440"
+DEFAULT_HOTSPOT = (0.28, 0.30)
+DEFAULT_STRENGTH = 0.15
+
+# How much of --strength reaches the hot end. The shadowed end gets all of it.
+HI_TINT_SHARE = 0.30
+
+# Gaussian noise attenuation. The gradient spans ~70 levels over ~2900px, which
+# is a contour band every 40px or so and plainly visible on a flat plate. A
+# little noise breaks the bands up, and it also reads as film grain, which helps
+# the plate sit with a photographed subject instead of against it.
+DEFAULT_GRAIN = 0.04
+
+
+def die(msg):
+    print(f"backdrop: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def run(cmd):
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        sys.exit(result.returncode)
+
+
+def capture(cmd):
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        die(result.stderr.strip() or f"command failed: {' '.join(cmd)}")
+    return result.stdout.strip()
+
+
+def parse_size(s):
+    m = re.fullmatch(r"(\d+)x(\d+)", s.strip())
+    if not m:
+        die(f"--size takes a WxH size, got {s!r}")
+    w, h = int(m.group(1)), int(m.group(2))
+    if w < 1 or h < 1:
+        die(f"--size dimensions must be positive, got {s!r}")
+    return w, h
+
+
+def parse_hotspot(s):
+    m = re.fullmatch(r"\s*([-\d.]+)\s*,\s*([-\d.]+)\s*", s)
+    if not m:
+        die(f"--hotspot takes fractional x,y, got {s!r}")
+    try:
+        x, y = float(m.group(1)), float(m.group(2))
+    except ValueError:
+        die(f"--hotspot takes fractional x,y, got {s!r}")
+    # Outside the canvas is legal and occasionally useful (a light source just
+    # off frame), but an order-of-magnitude slip is not.
+    for v, label in ((x, "x"), (y, "y")):
+        if not -1.0 <= v <= 2.0:
+            die(f"--hotspot {label} is a fraction of the canvas, got {v}")
+    return x, y
+
+
+def parse_unit(s, label):
+    try:
+        v = float(s)
+    except ValueError:
+        die(f"{label} takes a number between 0 and 1, got {s!r}")
+    if not 0.0 <= v <= 1.0:
+        die(f"{label} must be between 0 and 1, got {s!r}")
+    return v
+
+
+def resolve_color(spec):
+    """Turn any ImageMagick color spec into an (r, g, b) triple 0-255.
+
+    Going through ImageMagick rather than parsing hex means --tint accepts the
+    same names the rest of the pipeline does: 'slate', 'steelblue', 'rgb(...)'.
+    """
+    out = capture(["magick", "xc:" + spec, "-depth", "8", "-format",
+                   "%[fx:int(255*r+0.5)],%[fx:int(255*g+0.5)],%[fx:int(255*b+0.5)]",
+                   "info:"])
+    try:
+        r, g, b = (int(v) for v in out.split(","))
+    except ValueError:
+        die(f"could not resolve color {spec!r}")
+    return r, g, b
+
+
+def mix(base, tint, amount):
+    """Linear sRGB blend. Not perceptually correct, and that is fine here: both
+    endpoints are high-key and close together, where the error is invisible."""
+    return tuple(
+        max(0, min(255, int(round(b + (t - b) * amount))))
+        for b, t in zip(base, tint)
+    )
+
+
+def to_hex(rgb):
+    return "#%02X%02X%02X" % rgb
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="backdrop",
+        description="Generate a softly tinted gradient plate for a thumbnail.",
+    )
+    p.add_argument("output", help="destination PNG")
+    p.add_argument("--image", default=None, metavar="PATH",
+                   help="use this photograph as the plate instead of a "
+                        "generated gradient; it is cover-cropped to --size")
+    p.add_argument("--size", default=DEFAULT_SIZE,
+                   help=f"canvas size WxH (default {DEFAULT_SIZE})")
+    p.add_argument("--tint", default=None,
+                   help="hue to push into the plate; omit for a neutral gray wall")
+    p.add_argument("--strength", default=str(DEFAULT_STRENGTH),
+                   help=f"how far to push the tint, 0 to 1 (default {DEFAULT_STRENGTH})")
+    p.add_argument("--hotspot",
+                   default=f"{DEFAULT_HOTSPOT[0]},{DEFAULT_HOTSPOT[1]}",
+                   help=f"bright point as fractional x,y "
+                        f"(default {DEFAULT_HOTSPOT[0]},{DEFAULT_HOTSPOT[1]})")
+    p.add_argument("--grain", default=str(DEFAULT_GRAIN),
+                   help=f"noise to break up gradient banding, 0 disables "
+                        f"(default {DEFAULT_GRAIN})")
+    p.add_argument("--force", action="store_true",
+                   help="overwrite the output if it exists")
+    args = p.parse_args()
+
+    if os.path.exists(args.output) and not args.force:
+        die(f"{args.output} exists; pass --force to overwrite")
+
+    w, h = parse_size(args.size)
+
+    if args.image:
+        # A photograph brings its own light, so none of the gradient's knobs
+        # mean anything against it. Say so rather than accepting a flag that
+        # would be silently ignored.
+        for value, flag in ((args.tint, "--tint"),):
+            if value is not None:
+                die(f"{flag} shapes the generated gradient and does nothing to "
+                    "a photograph; drop one of them")
+        if not os.path.exists(args.image):
+            die(f"no such image: {args.image}")
+        # Cover, not fit: fill the frame on the long axis and crop the other,
+        # centered. A plate with letterboxing on it is not a plate.
+        run(["magick", args.image, "-auto-orient",
+             "-filter", "Lanczos", "-resize", f"{w}x{h}^",
+             "-gravity", "center", "-extent", f"{w}x{h}", "+repage",
+             "-colorspace", "sRGB", "-depth", "8", args.output])
+        return
+    hx_frac, hy_frac = parse_hotspot(args.hotspot)
+    strength = parse_unit(args.strength, "--strength")
+    grain = parse_unit(args.grain, "--grain")
+
+    if args.tint is None:
+        lo, hi = BASE_LO, BASE_HI
+    else:
+        tint = resolve_color(args.tint)
+        lo = mix(BASE_LO, tint, strength)
+        hi = mix(BASE_HI, tint, strength * HI_TINT_SHARE)
+
+    hx, hy = hx_frac * w, hy_frac * h
+
+    # ImageMagick's radial-gradient centers itself and reaches its second color
+    # at half the smaller dimension, clamping to it beyond. So a square of side
+    # 2R has a center at (R, R) that falls to black exactly at radius R. Set R
+    # to the farthest corner and the darkest pixel in the crop is the corner
+    # itself, which is what the measured endpoints describe.
+    radius = max(
+        math.hypot(hx - cx, hy - cy)
+        for cx in (0, w)
+        for cy in (0, h)
+    )
+    radius = int(math.ceil(radius))
+    side = 2 * radius
+
+    # Crop the window whose (hx, hy) sits on the gradient's center.
+    off_x = radius - int(round(hx))
+    off_y = radius - int(round(hy))
+
+    tmpdir = tempfile.mkdtemp(prefix="backdrop.")
+    try:
+        cmd = [
+            "magick",
+            "-size", f"{side}x{side}", "radial-gradient:white-black",
+            "-crop", f"{w}x{h}+{off_x}+{off_y}", "+repage",
+            "-colorspace", "sRGB",
+            "+level-colors", f"{to_hex(lo)},{to_hex(hi)}",
+        ]
+        if grain > 0:
+            cmd += ["-attenuate", str(grain), "+noise", "Gaussian"]
+        cmd += ["-depth", "8", args.output]
+        run(cmd)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()

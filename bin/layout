@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""Print the box geometry for one thumbnail composition.
+
+    layout --side right
+    layout --side left --canvas 1280x720 --format sh
+
+Every other tool in the pipeline takes its sizes from here. `headline` and
+`banner` are handed the boxes this prints; `compose` places their output at the
+offsets this prints. The numbers themselves live in `thumblayout.py`, so tuning
+the composition is an edit to that one file.
+
+`--side` names the side the *subject* stands on. The type column takes the
+other side and the backdrop hotspot follows the type.
+
+JSON is the default because an agent driving the pipeline reads it without
+parsing a table. `--format sh` emits shell assignments for eval, and
+`--format table` is for looking at.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import thumblayout
+
+
+def die(msg):
+    print(f"layout: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def parse_size(s):
+    m = re.fullmatch(r"(\d+)x(\d+)", s.strip())
+    if not m:
+        die(f"--canvas takes a WxH size, got {s!r}")
+    w, h = int(m.group(1)), int(m.group(2))
+    if w < 1 or h < 1:
+        die(f"--canvas dimensions must be positive, got {s!r}")
+    return w, h
+
+
+def emit_table(g):
+    rows = [
+        ("backdrop", f"{g['backdrop']['width']}x{g['backdrop']['height']}",
+         f"hotspot={g['backdrop']['hotspot'][0]},{g['backdrop']['hotspot'][1]}"),
+        ("headline", thumblayout.geometry_string(g["headline"]),
+         f"align={g['headline']['align']} valign={g['headline']['valign']}"),
+        ("banner", thumblayout.geometry_string(g["banner"]), ""),
+        ("subject", f"h={g['subject']['height']}",
+         f"center_x={g['subject']['center_x']} bottom={g['subject']['bottom']}"),
+        ("export", f"{g['export']['width']}x{g['export']['height']}", ""),
+    ]
+    width = max(len(r[0]) for r in rows)
+    for name, geom, extra in rows:
+        print(f"{name.ljust(width)}  {geom}  {extra}".rstrip())
+
+
+def emit_sh(g):
+    print(f"SIDE={g['side']}")
+    print(f"TEXT_SIDE={g['text_side']}")
+    print(f"CANVAS={g['canvas']['width']}x{g['canvas']['height']}")
+    print(f"EXPORT={g['export']['width']}x{g['export']['height']}")
+    print(f"BACKDROP_BOX={g['backdrop']['width']}x{g['backdrop']['height']}")
+    print(f"BACKDROP_HOTSPOT={g['backdrop']['hotspot'][0]},{g['backdrop']['hotspot'][1]}")
+    print(f"HEADLINE_BOX={g['headline']['width']}x{g['headline']['height']}")
+    print(f"HEADLINE_XY=+{g['headline']['x']}+{g['headline']['y']}")
+    print(f"HEADLINE_ALIGN={g['headline']['align']}")
+    print(f"HEADLINE_VALIGN={g['headline']['valign']}")
+    print(f"BANNER_BOX={g['banner']['width']}x{g['banner']['height']}")
+    print(f"BANNER_XY=+{g['banner']['x']}+{g['banner']['y']}")
+    print(f"SUBJECT_HEIGHT={g['subject']['height']}")
+    print(f"SUBJECT_CENTER_X={g['subject']['center_x']}")
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="layout",
+        description="Print the box geometry for one thumbnail composition.",
+    )
+    p.add_argument(
+        "--side",
+        choices=("left", "right"),
+        default="right",
+        help="which side the subject stands on (default right)",
+    )
+    p.add_argument(
+        "--canvas",
+        default=f"{thumblayout.CANVAS[0]}x{thumblayout.CANVAS[1]}",
+        help=f"canvas size WxH (default {thumblayout.CANVAS[0]}x{thumblayout.CANVAS[1]})",
+    )
+    p.add_argument(
+        "--format",
+        choices=("json", "sh", "table"),
+        default="json",
+        help="output format (default json)",
+    )
+    args = p.parse_args()
+
+    g = thumblayout.compute(canvas=parse_size(args.canvas), side=args.side)
+
+    if args.format == "json":
+        print(json.dumps(g, indent=2))
+    elif args.format == "sh":
+        emit_sh(g)
+    else:
+        emit_table(g)
+
+
+if __name__ == "__main__":
+    main()

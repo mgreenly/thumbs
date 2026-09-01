@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""Stack the generated layers into a finished thumbnail.
+
+    compose thumb.jpg --side right \\
+      --backdrop plate.png --subject face-cut.png \\
+      --headline head.png --banner bar.png
+
+Every other tool in the pipeline produces one layer and knows nothing about
+where it goes. This is where placement lives, and the coordinates come from
+`thumblayout`, the same module `bin/layout` prints.
+
+The canvas size is taken from the backdrop rather than from a flag, because the
+backdrop is the plate and the plate is the frame. The headline and banner PNGs
+are then checked against the boxes the layout computes for that canvas, and a
+mismatch is a hard error. That check is the reason the layout module exists: it
+is what makes a stale `head.png` from a different `--side` fail immediately
+instead of quietly landing 300px off.
+
+Layer order is plate, stage, subject, headline, banner. The stage is the shape
+the subject stands in front of, drawn on the full canvas, so it needs no
+placement of its own. The headline sits above the subject so that copy stays
+legible if a gesturing hand strays into the type column; `--subject-front`
+swaps them for the shots where the hand should read as being in front. The
+banner is always last, so the subject runs off the bottom of the frame behind
+it.
+
+The composite is built at the backdrop's resolution and downsampled to the
+export size at the very end. Type edges and gradient banding both survive that
+better than they survive being drawn at 1280x720 in the first place.
+"""
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import thumblayout
+
+
+def die(msg):
+    print(f"compose: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def run(cmd):
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        sys.exit(result.returncode)
+
+
+def capture(cmd):
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        die(result.stderr.strip() or f"command failed: {' '.join(cmd)}")
+    return result.stdout.strip()
+
+
+def image_size(path):
+    out = capture(["magick", "identify", "-format", "%w %h", path + "[0]"])
+    try:
+        w, h = (int(v) for v in out.split())
+    except ValueError:
+        die(f"could not read the size of {path}")
+    return w, h
+
+
+def parse_size(s):
+    m = re.fullmatch(r"(\d+)x(\d+)", s.strip())
+    if not m:
+        die(f"--export takes a WxH size, got {s!r}")
+    return int(m.group(1)), int(m.group(2))
+
+
+def parse_geom(s):
+    m = re.fullmatch(r"(\d+)x(\d+)\+(\d+)\+(\d+)", s.strip())
+    if not m:
+        die(f"--headline-box takes a WxH+X+Y geometry, got {s!r}")
+    w, h, x, y = (int(v) for v in m.groups())
+    return {"width": w, "height": h, "x": x, "y": y}
+
+
+def check_box(path, expected, label, side):
+    """Fail loudly when a layer was not built at the size this layout wants."""
+    got = image_size(path)
+    want = (expected["width"], expected["height"])
+    if got != want:
+        die(f"{label} {path} is {got[0]}x{got[1]}, but the layout for "
+            f"--side {side} wants {want[0]}x{want[1]}. Rebuild it with "
+            f"--box {want[0]}x{want[1]} (see `layout --side {side}`).")
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="compose",
+        description="Stack the generated layers into a finished thumbnail.",
+    )
+    p.add_argument("output", help="destination image")
+    p.add_argument("--backdrop", required=True,
+                   help="the plate; its size sets the working canvas")
+    p.add_argument("--stage", default=None,
+                   help="the shape the subject stands in front of, from stage; "
+                        "a full-canvas PNG, so it needs no placement")
+    p.add_argument("--subject", default=None,
+                   help="cut-out subject on transparency, from unback")
+    p.add_argument("--headline", default=None, help="type layer, from headline")
+    p.add_argument("--headline-box", default=None, metavar="WxH+X+Y",
+                   help="place the headline at this box instead of the fixed "
+                        "layout column, from freebox")
+    p.add_argument("--banner", default=None, help="bottom bar, from banner")
+    p.add_argument("--side", choices=("left", "right"), default="right",
+                   help="which side the subject stands on (default right)")
+    p.add_argument("--mirror", action="store_true",
+                   help="flip the subject horizontally, so a gesturing hand "
+                        "points into the type instead of off the frame")
+    p.add_argument("--subject-inset", type=float, default=None, metavar="FRAC",
+                   help="override the subject's horizontal center, as a "
+                        "fraction of canvas width from its own side; smaller "
+                        "pushes it further into its corner (default 0.26)")
+    p.add_argument("--framing", choices=tuple(thumblayout.FRAMINGS), default=None,
+                   help="the share of the frame the portrait takes: "
+                        "'full' is the half-frame subject, a fraction "
+                        "is one of the smaller ones (default full)")
+    p.add_argument("--subject-front", action="store_true",
+                   help="place the subject above the headline instead of below")
+    p.add_argument("--export", default=None,
+                   help="final size WxH (default: the layout's export size; "
+                        "pass the canvas size to skip downsampling)")
+    p.add_argument("--quality", default="92",
+                   help="JPEG quality, ignored for PNG output (default 92)")
+    p.add_argument("--force", action="store_true",
+                   help="overwrite the output if it exists")
+    args = p.parse_args()
+
+    if os.path.exists(args.output) and not args.force:
+        die(f"{args.output} exists; pass --force to overwrite")
+    for path, label in ((args.backdrop, "backdrop"), (args.stage, "stage"),
+                        (args.subject, "subject"),
+                        (args.headline, "headline"), (args.banner, "banner")):
+        if path and not os.path.exists(path):
+            die(f"{label} {path} does not exist")
+
+    framing = args.framing or "full"
+
+    canvas = image_size(args.backdrop)
+    try:
+        g = thumblayout.compute(canvas=canvas, side=args.side,
+                                subject_inset=args.subject_inset,
+                                framing=framing)
+    except ValueError as e:
+        die(str(e))
+
+    if args.headline_box:
+        g["headline"] = parse_geom(args.headline_box)
+
+    if args.stage:
+        # The stage is drawn on the full canvas rather than in a box, so the
+        # only thing to check is that it was drawn on *this* canvas.
+        got = image_size(args.stage)
+        if got != canvas:
+            die(f"stage {args.stage} is {got[0]}x{got[1]}, but the plate is "
+                f"{canvas[0]}x{canvas[1]}. Rebuild it with "
+                f"--size {canvas[0]}x{canvas[1]}.")
+    if args.headline:
+        check_box(args.headline, g["headline"], "headline", args.side)
+    if args.banner:
+        check_box(args.banner, g["banner"], "banner", args.side)
+
+    export = parse_size(args.export) if args.export else (
+        g["export"]["width"], g["export"]["height"])
+
+    tmpdir = tempfile.mkdtemp(prefix="compose.")
+    try:
+        layers = []
+
+        if args.stage:
+            layers.append((args.stage, 0, 0))
+
+        if args.subject:
+            # The cutout arrives as a full frame that is mostly transparent, so
+            # its own canvas says nothing about where the subject is. Trim to
+            # the ink first; every placement number below is about the person,
+            # not about the frame they were cut out of.
+            sub = os.path.join(tmpdir, "subject.png")
+            cmd = ["magick", args.subject, "-trim", "+repage"]
+            if args.mirror:
+                cmd += ["-flop"]
+            cmd += ["-filter", "Lanczos", "-resize",
+                    f"x{g['subject']['height']}", sub]
+            run(cmd)
+
+            sw, sh = image_size(sub)
+            sx = g["subject"]["center_x"] - sw // 2
+            sy = g["subject"]["bottom"] - sh
+            layers.append((sub, sx, sy))
+
+        head = None
+        if args.headline:
+            head = (args.headline, g["headline"]["x"], g["headline"]["y"])
+
+        if head:
+            if args.subject_front and layers:
+                layers.insert(0, head)
+            else:
+                layers.append(head)
+
+        if args.banner:
+            layers.append((args.banner, g["banner"]["x"], g["banner"]["y"]))
+
+        cmd = ["magick", args.backdrop]
+        for path, x, y in layers:
+            cmd += [path, "-geometry", f"{x:+d}{y:+d}", "-composite"]
+        if export != canvas:
+            cmd += ["-filter", "Lanczos", "-resize", f"{export[0]}x{export[1]}!"]
+        cmd += ["-alpha", "remove", "-alpha", "off"]
+        if os.path.splitext(args.output)[1].lower() in (".jpg", ".jpeg"):
+            cmd += ["-quality", args.quality, "-sampling-factor", "4:4:4"]
+        cmd += [args.output]
+        run(cmd)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()

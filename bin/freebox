@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+"""Measure this frame's geometry off the placed subject's silhouette.
+
+    freebox --subject face-cut.png --side left --format sh
+    freebox --subject face-cut.png --side left --framing 1/3 --find stage
+
+Two things are measured rather than fixed, and both for the same reason: they
+depend on the person in the frame, not on the canvas. `--find box` is the
+headline's rectangle, described below. `--find stage` is the smallest circle
+holding the whole visible subject, which is the shape `stage` draws: the rule
+there is that the head and the body sit inside the ring, so the disc has no
+size of its own and is refit whenever the framing or the mirror changes.
+
+The fixed layout in `thumblayout` gives the headline a column on the opposite
+side from the subject. That is the Maher grid, and it is right when the subject
+is a clean half-frame silhouette. It wastes space when the subject is small, or
+off to a corner, or reaching a hand into what would otherwise be the type
+column: the column is fixed, so the type shrinks to avoid the hand instead of
+sitting beside it.
+
+This computes the alternative: the biggest axis-aligned rectangle that does not
+overlap the subject at all, so the headline is placed into the actual negative
+space of *this* frame rather than a column decided in advance. `headline`
+already solves its pointsize to whatever `--box` it is handed, so filling the
+space is free once the box is known.
+
+The mask is the real silhouette, not its bounding box. That is the whole point:
+a raised finger blocks only its own few hundred px of width, and the rectangle
+tucks in beside it instead of being pushed off the frame by it.
+
+The subject is placed exactly as `compose` places it -- trimmed to its ink,
+scaled to the layout's subject height, centered at the layout's inset, bottom
+aligned to the canvas, optionally mirrored -- so the rectangle this prints is
+the empty space of the composite `compose` will actually build. The banner and
+a margin all round are treated as occupied too, so the box never lands under the
+bar or flush against an edge.
+"""
+
+import argparse
+import json
+import math
+import os
+import random
+import sys
+
+import numpy as np
+from PIL import Image
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import thumblayout
+
+# The rectangle search runs on a downscaled grid; the canvas is huge and a few
+# px of precision is well inside the margin. 4 turns 2560x1440 into 640x360.
+SCALE = 4
+
+# A pixel counts as subject if its alpha clears this. The matte is eroded a hair
+# by `unback` already, so anything above near-transparent is real ink.
+ALPHA_FLOOR = 16
+
+# Air left around the rectangle, as a fraction of canvas width. This is the
+# "border" -- the headline never touches the silhouette, the bar, or the edge.
+# Settled by eye at 0.04: enough air to read as deliberate, little enough that
+# the type stays large. Above ~0.05 the box shrinks and the headline goes small.
+MARGIN = 0.04
+
+# A block of type wants a box that is both wide and tall, not a sliver. The
+# biggest rectangle by raw area is often a thin full-width or full-height strip,
+# so the search maximizes area only among rectangles whose aspect (w/h) falls in
+# a band. Slivers outside it are discarded, not merely penalized: a soft
+# preference would let a big enough strip win anyway, which is the exact failure
+# the band exists to prevent.
+#
+# There are two bands because there are two kinds of type block. `wide` is the
+# headline's, settled by eye against three-line composites: from a little taller
+# than square (a chunky 3-line block) to a wide 1-line banner. `tall` is the
+# list's, a column of rows that cannot fill a short wide box and would only
+# shrink to fit one.
+SHAPES = {
+    "wide": (0.55, 3.20),
+    "tall": (0.40, 1.40),
+}
+
+
+def die(msg):
+    print(f"freebox: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def parse_size(s):
+    try:
+        w, h = (int(v) for v in s.lower().split("x"))
+        return w, h
+    except ValueError:
+        die(f"--size takes a WxH size, got {s!r}")
+
+
+def silhouette(args, canvas, g):
+    """A boolean canvas: True where the subject's ink is.
+
+    The subject is placed with the same trim/scale/center/mirror `compose`
+    uses, so this is the person as the composite will show them, clipped to the
+    frame because the body runs off it.
+    """
+    w, h = canvas
+    occ = np.zeros((h, w), dtype=bool)
+
+    src = Image.open(args.subject).convert("RGBA")
+    alpha = src.getchannel("A")
+    box = alpha.getbbox()
+    if box is None:
+        die("the subject matte is empty; nothing to place")
+    alpha = alpha.crop(box)
+    if args.mirror:
+        alpha = alpha.transpose(Image.FLIP_LEFT_RIGHT)
+
+    target_h = g["subject"]["height"]
+    scale = target_h / alpha.height
+    sw = max(1, round(alpha.width * scale))
+    alpha = alpha.resize((sw, target_h), Image.LANCZOS)
+    sil = np.asarray(alpha) > ALPHA_FLOOR
+
+    # Same offsets as compose: center at the layout's subject center, bottom on
+    # the canvas floor. Clip to the visible region, since the body runs off.
+    sx = g["subject"]["center_x"] - sw // 2
+    sy = g["subject"]["bottom"] - target_h
+    x0, y0 = max(0, sx), max(0, sy)
+    x1, y1 = min(w, sx + sw), min(h, sy + target_h)
+    if x1 > x0 and y1 > y0:
+        occ[y0:y1, x0:x1] |= sil[y0 - sy:y1 - sy, x0 - sx:x1 - sx]
+
+    return occ
+
+
+def occupancy(args, canvas, g, sil, disc=None):
+    """A boolean canvas: True where the headline may not go.
+
+    The silhouette, the banner, and the stage's disc if one is drawn. The disc
+    counts even where no pixel of the subject is in the way: it is a drawn
+    shape, and type laid over it would read as a mistake.
+    """
+    w, h = canvas
+    occ = sil.copy()
+
+    if disc:
+        outer = disc["radius"] + disc["ring"]
+        yy, xx = np.ogrid[:h, :w]
+        occ |= ((xx - disc["center_x"]) ** 2
+                + (yy - disc["center_y"]) ** 2) <= outer ** 2
+
+    if not args.no_banner:
+        b = g["banner"]
+        occ[b["y"]:b["y"] + b["height"], b["x"]:b["x"] + b["width"]] = True
+
+    return occ
+
+
+# ------------------------------------------------------------------- the disc
+
+
+def _circle(p, q=None, r=None):
+    """The circle through one, two or three points; None if they are collinear."""
+    if q is None:
+        return (p[0], p[1], 0.0)
+    if r is None:
+        cx, cy = (p[0] + q[0]) / 2.0, (p[1] + q[1]) / 2.0
+        return (cx, cy, math.hypot(p[0] - cx, p[1] - cy))
+    (ax, ay), (bx, by), (cx_, cy_) = p, q, r
+    d = 2 * (ax * (by - cy_) + bx * (cy_ - ay) + cx_ * (ay - by))
+    if abs(d) < 1e-12:
+        return None
+    a2, b2, c2 = ax * ax + ay * ay, bx * bx + by * by, cx_ * cx_ + cy_ * cy_
+    ux = (a2 * (by - cy_) + b2 * (cy_ - ay) + c2 * (ay - by)) / d
+    uy = (a2 * (cx_ - bx) + b2 * (ax - cx_) + c2 * (bx - ax)) / d
+    return (ux, uy, math.hypot(ax - ux, ay - uy))
+
+
+def _holds(c, p):
+    return math.hypot(p[0] - c[0], p[1] - c[1]) <= c[2] + 1e-7
+
+
+def smallest_enclosing_circle(points):
+    """Welzl's minidisk, iteratively. Expected linear in the point count."""
+    pts = list(points)
+    random.shuffle(pts)
+    circle = _circle(pts[0])
+    for i, p in enumerate(pts):
+        if _holds(circle, p):
+            continue
+        circle = _circle(p)
+        for j in range(i):
+            q = pts[j]
+            if _holds(circle, q):
+                continue
+            circle = _circle(p, q)
+            for k in range(j):
+                r = pts[k]
+                if _holds(circle, r):
+                    continue
+                found = _circle(p, q, r)
+                if found:
+                    circle = found
+    return circle
+
+
+def stage_disc(canvas, g, sil):
+    """The circle the stage draws: the whole visible subject, just inside it.
+
+    The rule is about the person rather than the canvas -- head and body inside
+    the ring -- so the shape is measured off the placed matte instead of being
+    a fraction of the frame. Only what the viewer sees counts: below the bar the
+    body is covered anyway, and including it would drag the circle down and out
+    for pixels nobody looks at.
+
+    The subject's own extremes are the only points that can touch the boundary,
+    so the per-row and per-column extremes are all that go into the fit. That is
+    a few thousand points instead of a million, for the same circle.
+    """
+    w, h = canvas
+    visible = sil.copy()
+    visible[g["banner"]["y"]:, :] = False
+    ys, xs = np.nonzero(visible)
+    if len(xs) == 0:
+        die("the subject is entirely behind the bar; nothing to fit a stage to")
+
+    extremes = set()
+    for row in np.unique(ys):
+        line = xs[ys == row]
+        extremes.add((int(line.min()), int(row)))
+        extremes.add((int(line.max()), int(row)))
+    for col in np.unique(xs):
+        line = ys[xs == col]
+        extremes.add((int(col), int(line.min())))
+        extremes.add((int(col), int(line.max())))
+
+    cx, cy, r = smallest_enclosing_circle(
+        [(float(x), float(y)) for x, y in extremes])
+    s = g["stage"]
+    return {
+        "center_x": int(round(cx)),
+        "center_y": int(round(cy)),
+        # The fitted circle touches the ink; the drawn one keeps the gap off it
+        # and puts the ring outside that.
+        "radius": int(round(r)) + s["gap"],
+        "ring": s["ring"],
+    }
+
+
+def dilate(grid, k):
+    """Grow the occupied region by k cells, so the rectangle keeps that much
+    clearance from whatever it touches. A k-fold 4-neighbour spread; the slight
+    diamond vs square at the corners is invisible under a headline's margin."""
+    for _ in range(k):
+        g = grid.copy()
+        g[1:, :] |= grid[:-1, :]
+        g[:-1, :] |= grid[1:, :]
+        g[:, 1:] |= grid[:, :-1]
+        g[:, :-1] |= grid[:, 1:]
+        grid = g
+    return grid
+
+
+def largest_empty_rect(occ, margin_px, aspect, scale=SCALE):
+    """Biggest type-shaped empty rectangle, as (x, y, w, h) in occ coords.
+
+    The grid is reduced by `scale` first (a cell is occupied if any pixel in it
+    is), the occupied region is grown by `margin_px` and the canvas edges are
+    inset by the same, so the rectangle keeps an even border from every side --
+    the subject, the banner, and the frame edges alike. Then the classic
+    largest-rectangle-in-a-histogram sweep runs per row. That sweep visits every
+    maximal empty rectangle; among them this keeps the largest by area whose
+    aspect (w/h) is inside `aspect`, one of the bands in SHAPES, so a thin
+    full-width or full-height strip never wins over a block the type can fill.
+    """
+    aspect_min, aspect_max = aspect
+    h, w = occ.shape
+    gh, gw = h // scale, w // scale
+    grid = occ[:gh * scale, :gw * scale].reshape(gh, scale, gw, scale).any(axis=(1, 3))
+
+    m = round(margin_px / scale)
+    if m:
+        grid = dilate(grid, m)
+        grid[:m, :] = grid[-m:, :] = grid[:, :m] = grid[:, -m:] = True
+    free = ~grid
+
+    heights = np.zeros(gw, dtype=int)
+    best = (0, 0, 0, 0)  # area-carrying (x, y, w, h) in grid cells
+    best_area = 0
+    for row in range(gh):
+        heights = np.where(free[row], heights + 1, 0)
+        # Sentinel-flanked stack sweep for every maximal rectangle under heights.
+        stack = [-1]
+        hh = list(heights) + [0]
+        for i, cur in enumerate(hh):
+            while stack[-1] != -1 and hh[stack[-1]] >= cur:
+                top = stack.pop()
+                height = hh[top]
+                left = stack[-1] + 1
+                width = i - left
+                area = height * width
+                aspect = width / height if height else 0
+                if area > best_area and aspect_min <= aspect <= aspect_max:
+                    best_area = area
+                    # bottom row is `row`, top is row-height+1
+                    best = (left, row - height + 1, width, height)
+            stack.append(i)
+
+    gx, gy, gwid, ghei = best
+    return gx * scale, gy * scale, gwid * scale, ghei * scale
+
+
+def print_disc(disc, fmt):
+    if fmt == "json":
+        print(json.dumps(disc, indent=2))
+    elif fmt == "sh":
+        print(f"STAGE_CENTER={disc['center_x']},{disc['center_y']}")
+        print(f"STAGE_RADIUS={disc['radius']}")
+        print(f"STAGE_RING={disc['ring']}")
+    else:
+        print(f"stage  center={disc['center_x']},{disc['center_y']}  "
+              f"radius={disc['radius']}  ring={disc['ring']}")
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="freebox",
+        description="Find the largest empty rectangle for a headline, given "
+                    "the placed subject.",
+    )
+    p.add_argument("--subject", required=True,
+                   help="cut-out subject on transparency, from unback")
+    p.add_argument("--size", default="2560x1440",
+                   help="canvas size WxH (default 2560x1440)")
+    p.add_argument("--side", choices=("left", "right"), default="right",
+                   help="which side the subject stands on (default right)")
+    p.add_argument("--subject-inset", type=float, default=None, metavar="FRAC",
+                   help="subject center as a fraction of width from its side, "
+                        "matching compose (default: the layout's 0.26)")
+    p.add_argument("--mirror", action="store_true",
+                   help="the subject is mirrored, as compose does")
+    p.add_argument("--shape", choices=tuple(SHAPES), default="wide",
+                   help="the shape of type going into the box: 'wide' for a "
+                        "headline (default), 'tall' for a list, which is a "
+                        "column of rows and cannot fill a short wide box")
+    p.add_argument("--framing", choices=tuple(thumblayout.FRAMINGS), default=None,
+                   help="the share of the frame the portrait takes, as "
+                        "compose does (default full)")
+    p.add_argument("--find", choices=("box", "stage"), default="box",
+                   help="'box' is the headline's rectangle (default); 'stage' "
+                        "is the circle that holds the whole visible subject, "
+                        "which is what the stage draws")
+    p.add_argument("--stage", action="store_true",
+                   help="a stage is drawn, as compose does, so its disc counts "
+                        "as occupied space; --find box only")
+    p.add_argument("--no-banner", action="store_true",
+                   help="do not treat the banner region as occupied")
+    p.add_argument("--format", choices=("json", "sh", "table"), default="table",
+                   help="how to print the result (default table)")
+    args = p.parse_args()
+
+    if not os.path.exists(args.subject):
+        die(f"no such file: {args.subject}")
+
+    canvas = parse_size(args.size)
+    framing = args.framing or "full"
+    try:
+        g = thumblayout.compute(canvas=canvas, side=args.side,
+                                subject_inset=args.subject_inset,
+                                framing=framing)
+    except ValueError as e:
+        die(str(e))
+
+    sil = silhouette(args, canvas, g)
+
+    if args.find == "stage":
+        print_disc(stage_disc(canvas, g, sil), args.format)
+        return
+
+    # The same circle the stage would draw, because that is the shape actually
+    # in the way; a headline must not land on it.
+    disc = stage_disc(canvas, g, sil) if args.stage else None
+    occ = occupancy(args, canvas, g, sil, disc)
+    margin_px = round(MARGIN * canvas[0])
+    x, y, w, h = (int(v) for v in largest_empty_rect(occ, margin_px,
+                                                     SHAPES[args.shape]))
+    if w == 0 or h == 0:
+        die(f"no empty rectangle found for a {args.shape} block; the subject "
+            "fills the frame")
+
+    # The type is grown to fill this box and centered in it, both axes: the box
+    # is the negative space, so its center is where the eye already rests.
+    box = {"width": w, "height": h, "x": x, "y": y,
+           "align": "center", "valign": "middle"}
+
+    if args.format == "json":
+        print(json.dumps(box, indent=2))
+    elif args.format == "sh":
+        print(f"HEADLINE_BOX={w}x{h}")
+        print(f"HEADLINE_GEOM={w}x{h}+{x}+{y}")
+        print(f"HEADLINE_ALIGN={box['align']}")
+        print(f"HEADLINE_VALIGN={box['valign']}")
+    else:
+        print(f"headline  {w}x{h}+{x}+{y}  align={box['align']} "
+              f"valign={box['valign']}")
+
+
+if __name__ == "__main__":
+    main()

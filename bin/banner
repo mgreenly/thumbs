@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""Draw the bar that runs along the bottom of a thumbnail, on a transparent
+canvas.
+
+    banner bar.png --box 2560x202 -t 'the part nobody *tells you*'
+
+The output is a PNG exactly the size of the box, transparent except for the bar
+itself. Where it sits in the frame is `compose`'s problem, and the box comes
+from `layout`.
+
+This is the michaelgreenly.dev answer to the yellow bar on the Matt Maher
+thumbnails. That bar is doing two jobs, carrying a color signal and anchoring
+the composition with a band of visual weight. Against a pale tinted plate the
+weight matters more, and the site palette has no yellow, so the bar is
+#18181B, the site's text color. Keeping it dark rather than blue also keeps
+blue meaning exactly one thing across the whole system: the accent. A blue bar
+would need some third treatment for accents inside it, and the accent would
+stop being a signal.
+
+The copy is set in IBM Plex Mono, the site's third face and otherwise unused
+here. It supplies the texture contrast against the IBM Plex Sans headline that
+Maher gets from setting his bar in an italic serif, and mono reads as
+developer, which is the channel.
+
+No type is set here. A word wrapped in asterisks is an accent exactly as it is
+in a headline, because the type is set by shelling out to `bin/headline` with
+different fonts and colors. There is one text engine in this pipeline and this
+is not it.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+BIN = os.path.dirname(os.path.abspath(__file__))
+HEADLINE = os.path.join(BIN, "headline")
+
+FILL = "#18181B"  # --color-text; see the module docstring for why not blue
+COLOR = "#FFFFFF"  # --color-accent-fg
+ACCENT_COLOR = "#2563EB"  # --color-accent
+
+# Regular body against Medium accent. The accent already changes color, so the
+# weight step is deliberately the smallest one the family offers; anything more
+# fights the color rather than reinforcing it.
+FONT = "IBM-Plex-Mono-Regular"
+ACCENT_FONT = "IBM-Plex-Mono-Medium"
+
+# Vertical air above and below the type, as a fraction of bar height. Mono
+# ascenders and descenders both run tall, so the optical center needs more
+# padding than a sans would.
+DEFAULT_PAD_Y = 0.26
+# Horizontal inset, as a fraction of bar *height*, not width: it should read as
+# the same air as the vertical padding regardless of how wide the frame is.
+DEFAULT_PAD_X = 0.45
+
+BOX_RE = re.compile(r"^(\d+)x(\d+)$")
+OPAQUE_SUFFIXES = (".jpg", ".jpeg", ".jpe", ".bmp", ".pbm", ".pgm", ".ppm")
+
+
+def die(msg):
+    print(f"banner: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def run(cmd):
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        sys.exit(result.returncode)
+
+
+def parse_box(s):
+    m = BOX_RE.match(s.strip())
+    if not m:
+        if "+" in s:
+            die("--box takes a size only; placement is compose's job")
+        die(f"--box takes a WxH size, got {s!r}")
+    w, h = int(m.group(1)), int(m.group(2))
+    if w < 1 or h < 1:
+        die(f"--box dimensions must be positive, got {s!r}")
+    return w, h
+
+
+def write_dump(path, box, fill, type_layout, pad):
+    """Rewrite headline's type layout into bar coordinates, around the bar.
+
+    `headline` sets the copy into a box inset by the padding and knows nothing
+    about the bar it will sit on, exactly as it knows nothing about the plate a
+    headline lands on. Shifting its baselines and x offsets by that inset here
+    is the same translation the -composite does to the pixels, so the dump
+    describes the bar as drawn rather than the type in isolation.
+    """
+    w, h = box
+    pad_x, pad_y = pad
+    doc = {
+        "box": {"width": w, "height": h},
+        "bar": {"x": 0, "y": 0, "width": w, "height": h, "fill": fill},
+        "lines": [],
+    }
+    if type_layout:
+        doc.update({k: v for k, v in type_layout.items()
+                    if k not in ("box", "lines")})
+        doc["lines"] = [
+            {
+                "baseline": line["baseline"] + pad_y,
+                "segments": [dict(seg, x=seg["x"] + pad_x)
+                             for seg in line["segments"]],
+            }
+            for line in type_layout["lines"]
+        ]
+    with open(path, "w") as fh:
+        json.dump(doc, fh, indent=2)
+        fh.write("\n")
+
+
+def parse_unit(s, label):
+    try:
+        v = float(s)
+    except ValueError:
+        die(f"{label} takes a number between 0 and 1, got {s!r}")
+    if not 0.0 <= v < 0.5:
+        die(f"{label} must be at least 0 and under 0.5, got {s!r}")
+    return v
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="banner",
+        description="Draw the bottom bar of a thumbnail on a transparent canvas.",
+    )
+    p.add_argument("output", help="destination PNG")
+    p.add_argument("--box", required=True, help="canvas size WxH, from layout")
+    p.add_argument("-t", "--text", action="append", default=[], metavar="LINE",
+                   help="a line of bar copy; *word* sets an accent. Repeatable.")
+    p.add_argument("--fill", default=FILL, help=f"bar color (default {FILL})")
+    p.add_argument("--color", default=COLOR, help=f"text color (default {COLOR})")
+    p.add_argument("--accent-color", default=ACCENT_COLOR,
+                   help=f"accent text color (default {ACCENT_COLOR})")
+    p.add_argument("--font", default=FONT, help=f"body face (default {FONT})")
+    p.add_argument("--accent-font", default=ACCENT_FONT,
+                   help=f"accent face (default {ACCENT_FONT})")
+    p.add_argument("--align", default="center",
+                   choices=("left", "center", "right"),
+                   help="horizontal alignment of the copy (default center)")
+    p.add_argument("--case", default=None,
+                   choices=("upper", "none"),
+                   help="force the copy's case (default: as typed)")
+    p.add_argument("--font-size", default=None,
+                   help="fix the pointsize instead of solving it to the box")
+    p.add_argument("--pad-y", default=str(DEFAULT_PAD_Y),
+                   help=f"air above and below the type, as a fraction of bar "
+                        f"height (default {DEFAULT_PAD_Y})")
+    p.add_argument("--pad-x", default=str(DEFAULT_PAD_X),
+                   help=f"air at the ends, as a fraction of bar height "
+                        f"(default {DEFAULT_PAD_X})")
+    p.add_argument("--dump-layout", default=None, metavar="PATH",
+                   help="also write the bar and its solved type to PATH as "
+                        "JSON, for `layered` to set as live text in an SVG")
+    p.add_argument("--force", action="store_true",
+                   help="overwrite the output if it exists")
+    args = p.parse_args()
+
+    if os.path.splitext(args.output)[1].lower() in OPAQUE_SUFFIXES:
+        die(f"{args.output} has no alpha channel; the bar is drawn on transparency")
+    if os.path.exists(args.output) and not args.force:
+        die(f"{args.output} exists; pass --force to overwrite")
+    if args.dump_layout and os.path.abspath(args.dump_layout) == os.path.abspath(
+            args.output):
+        die("--dump-layout and the output are the same file; the layout "
+            "describes the PNG, it does not replace it")
+    if args.dump_layout and os.path.exists(args.dump_layout) and not args.force:
+        die(f"{args.dump_layout} exists; pass --force to overwrite")
+
+    w, h = parse_box(args.box)
+    pad_y = parse_unit(args.pad_y, "--pad-y")
+    pad_x = parse_unit(args.pad_x, "--pad-x")
+
+    pad_y_px = int(round(h * pad_y))
+    pad_x_px = int(round(h * pad_x))
+    type_w = w - 2 * pad_x_px
+    type_h = h - 2 * pad_y_px
+    if args.text and (type_w < 1 or type_h < 1):
+        die(f"padding leaves no room for type in a {w}x{h} bar; "
+            f"lower --pad-x/--pad-y")
+
+    tmpdir = tempfile.mkdtemp(prefix="banner.")
+    try:
+        # The bar itself. Full-bleed within its own box, so the transparency is
+        # only ever exercised by a caller who asks for a box taller than the
+        # bar, but the contract stays the same as every other generator's.
+        bar = os.path.join(tmpdir, "bar.png")
+        run(["magick", "-size", f"{w}x{h}", f"xc:{args.fill}", bar])
+
+        if not args.text:
+            if args.dump_layout:
+                write_dump(args.dump_layout, (w, h), args.fill, None, (0, 0))
+            shutil.move(bar, args.output)
+            return
+
+        # One text engine in this pipeline, and it is headline.
+        type_png = os.path.join(tmpdir, "type.png")
+        type_json = os.path.join(tmpdir, "type.json")
+        cmd = [HEADLINE, type_png, "--box", f"{type_w}x{type_h}",
+               "--font", args.font, "--accent-font", args.accent_font,
+               "--color", args.color, "--accent-color", args.accent_color,
+               "--align", args.align, "--valign", "middle", "--no-shadow"]
+        if args.case:
+            cmd += ["--case", args.case]
+        if args.font_size:
+            cmd += ["--font-size", args.font_size]
+        if args.dump_layout:
+            cmd += ["--dump-layout", type_json]
+        for line in args.text:
+            cmd += ["-t", line]
+        run(cmd)
+
+        run(["magick", bar, type_png, "-geometry",
+             f"+{pad_x_px}+{pad_y_px}", "-composite", args.output])
+
+        if args.dump_layout:
+            with open(type_json) as fh:
+                write_dump(args.dump_layout, (w, h), args.fill,
+                           json.load(fh), (pad_x_px, pad_y_px))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()

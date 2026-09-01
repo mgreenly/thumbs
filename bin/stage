@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""Draw the shape the subject stands in front of: a flat field with a ring.
+
+    stage 1-stage.png --size 2560x1440 --form circle \\
+      --center 666,1008 --radius 658 --ring 31
+
+The subject is an actor, the backdrop is behind everything, and this is the
+stage between them. It is a full-canvas PNG, transparent except for the shape,
+composited above the plate and below the subject.
+
+It exists for the halo. A cut-out's edge is a few pixels of semi-transparent
+hair, and how much of it you see is a matter of what is behind it: against a
+gradient or a photograph the fringe reads as a rim of the wrong color, and
+against a flat field close to its own value it disappears. So the fill is not
+decoration. Pick it near what the hair is fringed with and the cut stops
+announcing itself; the ring is what keeps a near-plate fill from reading as a
+smudge rather than a shape.
+
+The shape runs off the frame wherever the geometry puts it. In the composition
+this was modeled on, the disc is wider than its own half of the frame and its
+center sits low, so what you see is a big arc entering from one side and
+disappearing behind the bottom bar. Nothing clips it but the canvas.
+
+Geometry arrives in pixels because `thumblayout` owns the fractions, the same
+way `banner` is handed its box rather than computing one. `--dump-layout`
+writes the shape out as JSON so `layered` can redraw it as a real SVG circle
+instead of linking this PNG; a vector shape is worth having live in the
+hand-off file for the same reason the type is.
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+# The middle of the wall `backdrop` builds its gradient between: halfway from
+# its shadowed corner (#BDBABD) to its hotspot (#FFFFFF). That is deliberately
+# the plate's own color rather than a color of its own, because the fringe on
+# the cut-out is the studio wall and this is what it has to disappear into.
+DEFAULT_FILL = "#DEDCDE"
+# The bar's black. The palette has one dark and this is it.
+DEFAULT_RING_COLOR = "#18181B"
+
+DEFAULT_SIZE = "2560x1440"
+
+
+def die(msg):
+    print(f"stage: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def run(cmd):
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        sys.exit(result.returncode)
+
+
+def capture(cmd):
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        die(result.stderr.strip() or f"command failed: {' '.join(cmd)}")
+    return result.stdout.strip()
+
+
+def parse_size(s):
+    m = re.fullmatch(r"(\d+)x(\d+)", s.strip())
+    if not m:
+        die(f"--size takes a WxH size, got {s!r}")
+    w, h = int(m.group(1)), int(m.group(2))
+    if w < 1 or h < 1:
+        die(f"--size dimensions must be positive, got {s!r}")
+    return w, h
+
+
+def parse_point(s, label):
+    m = re.fullmatch(r"\s*(-?\d+)\s*,\s*(-?\d+)\s*", s)
+    if not m:
+        die(f"{label} takes pixel x,y, got {s!r}")
+    return int(m.group(1)), int(m.group(2))
+
+
+def resolve_color(spec):
+    """Normalize any ImageMagick color spec to #RRGGBB.
+
+    The PNG does not care, but the layout dump does: SVG has no idea what
+    'slate' is, and `layered` should not have to guess.
+    """
+    out = capture(["magick", "xc:" + spec, "-depth", "8", "-format",
+                   "%[fx:int(255*r+0.5)],%[fx:int(255*g+0.5)],"
+                   "%[fx:int(255*b+0.5)]", "info:"])
+    try:
+        r, g, b = (int(v) for v in out.split(","))
+    except ValueError:
+        die(f"could not resolve color {spec!r}")
+    return "#%02X%02X%02X" % (r, g, b)
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="stage",
+        description="Draw the shape the subject stands in front of.",
+    )
+    p.add_argument("output", help="destination PNG")
+    p.add_argument("--size", default=DEFAULT_SIZE,
+                   help=f"canvas size WxH (default {DEFAULT_SIZE})")
+    p.add_argument("--form", choices=("circle",), default="circle",
+                   help="which shape to draw (default circle)")
+    p.add_argument("--center", required=True, metavar="X,Y",
+                   help="the shape's center in pixels, from thumblayout")
+    p.add_argument("--radius", type=int, required=True, metavar="R",
+                   help="the filled radius in pixels; the ring sits outside it")
+    p.add_argument("--ring", type=int, default=0, metavar="N",
+                   help="border thickness in pixels, 0 for no border "
+                        "(default 0)")
+    p.add_argument("--fill", default=DEFAULT_FILL,
+                   help=f"the flat field's color (default {DEFAULT_FILL})")
+    p.add_argument("--ring-color", default=DEFAULT_RING_COLOR,
+                   help=f"the border's color (default {DEFAULT_RING_COLOR})")
+    p.add_argument("--dump-layout", default=None, metavar="JSON",
+                   help="also write the shape as JSON, for `layered`")
+    p.add_argument("--force", action="store_true",
+                   help="overwrite the output if it exists")
+    args = p.parse_args()
+
+    for path in (args.output, args.dump_layout):
+        if path and os.path.exists(path) and not args.force:
+            die(f"{path} exists; pass --force to overwrite")
+
+    w, h = parse_size(args.size)
+    cx, cy = parse_point(args.center, "--center")
+    if args.radius < 1:
+        die(f"--radius must be positive, got {args.radius}")
+    if args.ring < 0:
+        die(f"--ring cannot be negative, got {args.ring}")
+
+    fill = resolve_color(args.fill)
+    ring_color = resolve_color(args.ring_color)
+
+    # ImageMagick centers a stroke on the path it is drawn along, so the path
+    # is put half a ring outside the filled radius. The fill then reaches
+    # exactly --radius and the ring occupies the next --ring pixels, which is
+    # how the border reads when you measure one off a finished thumbnail.
+    path_r = args.radius + args.ring / 2.0
+
+    cmd = ["magick", "-size", f"{w}x{h}", "xc:none", "-fill", fill]
+    if args.ring:
+        cmd += ["-stroke", ring_color, "-strokewidth", str(args.ring)]
+    else:
+        cmd += ["-stroke", "none"]
+    cmd += ["-draw", f"circle {cx},{cy} {cx},{cy + path_r:g}",
+            "-depth", "8", args.output]
+    run(cmd)
+
+    if args.dump_layout:
+        doc = {
+            "form": args.form,
+            "canvas": {"width": w, "height": h},
+            "center": {"x": cx, "y": cy},
+            "radius": args.radius,
+            "ring": args.ring,
+            "fill": fill,
+            "ring_color": ring_color,
+        }
+        with open(args.dump_layout, "w") as fh:
+            json.dump(doc, fh, indent=2)
+            fh.write("\n")
+
+
+if __name__ == "__main__":
+    main()
