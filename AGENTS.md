@@ -40,6 +40,12 @@ inputs beside its output: `<n>-backdrop.png`, `<n>-stage.png`,
 `<n>-headline.json` too, because it is the headline layer; the layer is named
 for its slot, not for whichever generator filled it.
 
+Each attempt also writes `<n>-run.json`, the effective settings that produced
+it: every flag the operator chose with the defaults filled in, so a folder
+revisited later says for itself how each `thumb-<n>.jpg` was made. It is the
+inputs to the attempt, where the sibling layouts are what the solvers then
+computed from them.
+
 A background photograph the operator drops in the folder is an *input*, not an
 attempt, so it carries no number: `background.jpg` or `background.png`, named
 by the operator, beside the portrait.
@@ -77,6 +83,8 @@ The flags it exposes are the ones the operator actually varies:
     --mirror               flip the subject horizontally
     -t COPY                headline copy; *word* is an accent
     --lines N              rebreak the headline into N lines (default 3)
+    --headline-valign POS  where the type sits in its box: top, middle or
+                           bottom (default middle, centered in the space found)
     --item COPY            one list row; repeat in order. Excludes -t
     --start N              number the first list row N (default 1)
     --shape wide|tall      the shape of box to look for; defaults to the one
@@ -94,6 +102,9 @@ The flags it exposes are the ones the operator actually varies:
                            side; smaller pushes it further into its corner and
                            leaves the headline more room (default 0.26)
     --font / --accent-font re-face the type
+    --theme NAME           a saved look (colors and faces) kept as NAME.json in
+                           the Thumbs root; its values fill in for the color and
+                           font flags, and any of those flags still wins over it
     --recut                re-run the cut even though `<stem>-cut.png` exists
 
 Anything past that, drop down to the individual tools. `thumbnail` wraps them,
@@ -124,6 +135,7 @@ not invent synonyms and do not guess at a term that was not used.
 | `portrait 1/3 <side>` / `portrait 3/5 <side>` | the same `--side`, at `--framing 1/3` or `--framing 3/5` |
 | `mirrored` | `--mirror` (flip the subject horizontally; off unless said) |
 | `headline in N lines: <copy>` | `--lines N -t '<copy>'` |
+| `headline pinned top` / `headline pinned bottom` | `--headline-valign top` / `bottom` (default middle) |
 | `list with:` then one item per line | `--item '<copy>'` per row, in order |
 | `wide list` / `tall headline` | `--shape` (otherwise inferred from the layer) |
 | `banner: <copy>` | `--banner '<copy>'` |
@@ -133,6 +145,7 @@ not invent synonyms and do not guess at a term that was not used.
 | `stage in <color in words>` | `--stage-fill '<hex>'` |
 | "stronger" / "more subtle" | `--strength` (default 0.20) |
 | "give the headline more room" | `--subject-inset` below 0.26 |
+| `theme-1` (any saved theme name) | `--theme theme-1`, the saved look in the Thumbs root |
 
 Those three terms stack in one order, which is the order of the layers. The
 plate is a generated backdrop unless the operator says `use the background`, in
@@ -201,6 +214,35 @@ not an open one. The defaults are:
 - **Type placement:** computed by `freebox` from this frame's negative space,
   centered in the box it finds. The box is `--shape wide` for a headline and
   `--shape tall` for a list.
+
+## Themes
+
+A theme is a named bundle of the look — the colors and faces — so the same
+wall, stage and type can be asked for by name across sessions rather than
+retyped. The operator says `theme-1` and it is `--theme theme-1`.
+
+Themes live one level up from the dated folders, in the Thumbs root
+(`~/Dropbox/Thumbs/<name>.json`), not in this tree and not in the session
+folder: a theme outlives any one session and is shared by all of them, and
+being in Dropbox it syncs with the work. The file is a flat JSON object whose
+keys are a subset of the tool's color and font settings:
+
+    { "tint": "#334155", "strength": "0.55",
+      "stage_fill": "#DEDCDE", "stage_ring": "#18181B",
+      "font": "IBM-Plex-Sans-SemiBold", "accent_font": "Space-Grotesk-Bold" }
+
+Those six keys are the whole vocabulary for now; an unknown key is an error, not
+a silent typo, and adding a key means teaching `thumbnail` to consume it. A
+theme is meant to be complete — it pins even the values that equal today's
+defaults, so a later change to a default does not quietly move a saved look.
+
+The precedence is one line: an explicit flag beats the theme, the theme beats
+the built-in default. So `theme-1` with a `--tint` still on the line takes that
+tint and the theme's everything-else. The theme names only the look; the
+layout, the copy, the framing and the stage's presence are still said each
+session. And what lands in `<n>-run.json` is the resolved values, with the
+theme's name beside them for provenance, so an attempt reproduces even if the
+theme file is gone.
 
 ## The tools
 

@@ -37,6 +37,16 @@ shape. It is independent of `--framing`, which is the share of the frame the
 portrait itself takes; the two are tuned against each other rather than one
 being derived from the other.
 
+Alongside the layers it writes `<n>-run.json`, the effective settings that
+produced the attempt: every flag with the defaults filled in, so a folder
+revisited later says for itself how each thumb-<n>.jpg was made.
+
+--theme NAME names a saved look -- colors and faces -- kept as NAME.json in the
+Thumbs root beside the dated folders. Its values fill in for the color and font
+flags; any of those flags passed on the line still wins over it. The resolved
+values, not the theme name, are what land in the run record, so an attempt
+reproduces even without the theme file.
+
 The portrait is cut once to `<stem>-cut.png` beside it and reused on later
 runs; pass --recut to force it (birefnet is slow). Nothing is overwritten: each
 run takes the next free number, so attempts accumulate.
@@ -76,6 +86,35 @@ def capture(cmd):
     return result.stdout
 
 
+# A theme is a named bundle of the look settings — colors and faces — so the
+# same wall, stage and type can be asked for by name across sessions instead of
+# retyped. It lives one level up from the dated folder, in the Thumbs root, so
+# it is shared by every session and syncs with the work. It fills in for the
+# flags it names; an explicit flag still wins, and the resolved values (not the
+# theme name) are what land in the run record, so an attempt reproduces without
+# the theme file.
+THEME_KEYS = ("tint", "strength", "stage_fill", "stage_ring", "font",
+              "accent_font")
+
+
+def load_theme(name, folder):
+    path = os.path.join(os.path.dirname(folder), f"{name}.json")
+    if not os.path.exists(path):
+        die(f"no such theme: {path}")
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        die(f"theme {path} is not valid json: {e}")
+    if not isinstance(data, dict):
+        die(f"theme {path} must be a json object of settings")
+    unknown = set(data) - set(THEME_KEYS)
+    if unknown:
+        die(f"theme {path} has unknown keys {sorted(unknown)}; "
+            f"known keys are {list(THEME_KEYS)}")
+    return data
+
+
 def next_number(folder):
     """The next unused attempt number, so attempts accumulate and never
     overwrite. Counts every numbered artifact, not just the finished JPEG, so a
@@ -85,7 +124,7 @@ def next_number(folder):
     for name in os.listdir(folder):
         m = (re.fullmatch(r"thumb-(\d+)\.(?:jpg|svg)", name)
              or re.fullmatch(
-                 r"(\d+)-(?:backdrop|stage|headline|banner)\.(?:png|json)",
+                 r"(\d+)-(?:backdrop|stage|headline|banner|run)\.(?:png|json)",
                  name))
         if m:
             used.append(int(m.group(1)))
@@ -115,6 +154,11 @@ def main():
                    help="which side the subject stands on (default right)")
     p.add_argument("--lines", type=int, default=3,
                    help="rebreak the headline into this many lines (default 3)")
+    p.add_argument("--headline-valign", choices=("top", "middle", "bottom"),
+                   default=None, metavar="POS",
+                   help="where the type sits in its box: 'top' pins it high, "
+                        "'bottom' low (default: middle, centered in the negative "
+                        "space freebox found)")
     p.add_argument("--subject-inset", type=float, default=None, metavar="FRAC",
                    help="subject center as a fraction of width from its side; "
                         "smaller gives the headline more room (default 0.26)")
@@ -124,9 +168,14 @@ def main():
     p.add_argument("--accent-font", default=None, help="headline accent face")
     p.add_argument("--banner", default=BANNER_DEFAULT, metavar="COPY",
                    help=f"banner copy (default {BANNER_DEFAULT})")
+    p.add_argument("--theme", default=None, metavar="NAME",
+                   help="a named look — colors and faces — kept as NAME.json in "
+                        "the Thumbs root beside the dated folders. Its values "
+                        "fill in for the flags below; any flag passed here still "
+                        "wins over it")
     p.add_argument("--tint", default=None,
                    help="backdrop tint hex; omit for a neutral gray wall")
-    p.add_argument("--strength", default="0.20",
+    p.add_argument("--strength", default=None,
                    help="backdrop tint strength 0-1 (default 0.20)")
     p.add_argument("--background", default=None, metavar="PATH",
                    help="use this photograph as the plate instead of the "
@@ -162,6 +211,18 @@ def main():
         die(f"no such portrait: {args.portrait}")
     folder = os.path.dirname(os.path.abspath(args.portrait))
 
+    # An explicit flag wins over the theme, the theme wins over the built-in
+    # default. Resolve every themed setting to one effective value here, and use
+    # only these below, so the run record holds the values actually rendered.
+    theme = load_theme(args.theme, folder) if args.theme else {}
+    pick = lambda flag, key: flag if flag is not None else theme.get(key)
+    eff_tint = pick(args.tint, "tint")
+    eff_strength = pick(args.strength, "strength") or "0.20"
+    eff_stage_fill = pick(args.stage_fill, "stage_fill")
+    eff_stage_ring = pick(args.stage_ring, "stage_ring")
+    eff_font = pick(args.font, "font")
+    eff_accent_font = pick(args.accent_font, "accent_font")
+
     stem = os.path.splitext(os.path.basename(args.portrait))[0]
     cut = os.path.join(folder, f"{stem}-cut.png")
     if args.recut or not os.path.exists(cut):
@@ -176,6 +237,7 @@ def main():
     headline_json = d(f"{n}-headline.json")
     banner = d(f"{n}-banner.png")
     banner_json = d(f"{n}-banner.json")
+    run_json = d(f"{n}-run.json")
     jpg = d(f"thumb-{n}.jpg")
     svg = d(f"thumb-{n}.svg")
 
@@ -205,10 +267,10 @@ def main():
              "--image", args.background])
     else:
         backdrop_cmd = [os.path.join(BIN, "backdrop"), backdrop, "--size",
-                        canvas, "--strength", args.strength,
+                        canvas, "--strength", eff_strength,
                         "--hotspot", f"{hx},{hy}"]
-        if args.tint:
-            backdrop_cmd += ["--tint", args.tint]
+        if eff_tint:
+            backdrop_cmd += ["--tint", eff_tint]
         run(backdrop_cmd)
 
     if args.stage:
@@ -222,10 +284,10 @@ def main():
                      "--center", f"{s['center_x']},{s['center_y']}",
                      "--radius", str(s["radius"]), "--ring", str(s["ring"]),
                      "--dump-layout", stage_json]
-        if args.stage_fill:
-            stage_cmd += ["--fill", args.stage_fill]
-        if args.stage_ring:
-            stage_cmd += ["--ring-color", args.stage_ring]
+        if eff_stage_fill:
+            stage_cmd += ["--fill", eff_stage_fill]
+        if eff_stage_ring:
+            stage_cmd += ["--ring-color", eff_stage_ring]
         run(stage_cmd)
 
     run([os.path.join(BIN, "banner"), banner, "--box", banner_box,
@@ -245,6 +307,8 @@ def main():
             [os.path.join(BIN, "freebox"), "--subject", cut,
              "--format", "json", "--shape", shape] + freebox_placement))
         geom = f"{box['width']}x{box['height']}+{box['x']}+{box['y']}"
+        if args.headline_valign:
+            box["valign"] = args.headline_valign
 
         # Both generators write the headline layer, take the same box, and dump
         # the same kind of layout, so everything downstream is untouched.
@@ -260,11 +324,48 @@ def main():
                 head_cmd += ["--start", str(args.start)]
         else:
             head_cmd += ["--lines", str(args.lines), "-t", args.headline]
-        if args.font:
-            head_cmd += ["--font", args.font]
-        if args.accent_font:
-            head_cmd += ["--accent-font", args.accent_font]
+        if eff_font:
+            head_cmd += ["--font", eff_font]
+        if eff_accent_font:
+            head_cmd += ["--accent-font", eff_accent_font]
         run(head_cmd)
+
+    # A record of how this attempt was made, so a folder revisited later says
+    # for itself what produced each thumb-<n>.jpg. These are the effective
+    # settings the operator chose, defaults filled in; the sibling
+    # <n>-headline/stage/banner.json hold what the solvers then computed from
+    # them. The portrait is stored by basename because the folder is the record.
+    type_kind = "list" if args.item else "headline" if args.headline else "none"
+    record = {
+        "number": n,
+        "portrait": os.path.basename(args.portrait),
+        "side": args.side,
+        "framing": framing,
+        "mirror": args.mirror,
+        "subject_inset": args.subject_inset,
+        "type": type_kind,
+        "headline": args.headline,
+        "lines": args.lines,
+        "items": args.item,
+        "start": args.start,
+        "shape": (args.shape or ("tall" if args.item else "wide"))
+                 if have_headline else None,
+        "headline_valign": args.headline_valign,
+        "banner": args.banner,
+        "background": (os.path.basename(args.background)
+                       if args.background else None),
+        "theme": args.theme,
+        "tint": eff_tint,
+        "strength": eff_strength,
+        "stage": args.stage,
+        "stage_fill": eff_stage_fill,
+        "stage_ring": eff_stage_ring,
+        "font": eff_font,
+        "accent_font": eff_accent_font,
+    }
+    with open(run_json, "x") as f:
+        json.dump(record, f, indent=2)
+        f.write("\n")
 
     compose_cmd = [os.path.join(BIN, "compose"), jpg,
                    "--backdrop", backdrop, "--subject", cut,
